@@ -1,14 +1,35 @@
-name: Lean Action CI
+name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 jobs:
   build:
+    name: Build & verify proofs
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v4
       - uses: leanprover/lean-action@v1
+
+  test:
+    name: Smoke test & spec testsuite
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        # lean-action caches .lake keyed by {OS}-{arch}-{toolchain}-{lake-manifest}-{SHA}.
+        # The test job runs on the same SHA, so it gets an exact hit from the build job's
+        # saved cache — all oleans are already present. build-args limits lake build to
+        # just the two executables, which are instant to verify from the restored cache.
+      - uses: leanprover/lean-action@v1
+        with:
+          build-args: runner testsuite
+      - name: Install just
+        uses: taiki-e/install-action@just
+      - name: Runner smoke test
+        run: just runner-smoke
+      - name: Wasm spec testsuite
+        run: just testsuite

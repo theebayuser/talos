@@ -6,7 +6,7 @@ import Interpreter.Wasm.Decoder.Wat
 
 Loads a `.wat` (read directly) or `.wasm` (decoded by shelling out to
 `wasm-tools print`) module, invokes one of its functions, and prints
-the results. See `tasks/04-runner.md` and the README for the contract.
+the results. See the README for the CLI contract.
 -/
 
 namespace Wasm.Runner

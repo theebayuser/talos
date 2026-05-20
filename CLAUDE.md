@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-A project for **verifying WebAssembly code using Lean 4**. The vehicle is a built-in Wasm interpreter written in Lean: the same definitions that *execute* a program are the ones you *reason about*, so there is no separate "spec" interpreter to keep in sync with the runner.
+A project for **verifying WebAssembly code using Lean 4**. The vehicle is a built-in Wasm interpreter written in Lean: the same definitions that _execute_ a program are the ones you _reason about_, so there is no separate "spec" interpreter to keep in sync with the runner.
 
 The interpreter is deliberately optimized for **simplicity of reasoning, not execution speed**. When making changes, prefer the formulation that is easiest to unfold and `simp` through in proofs over the one that runs faster — performance work belongs behind a separate, proven-equivalent implementation, not in the reference interpreter.
 
@@ -13,8 +13,7 @@ Lean toolchain is pinned in `lean-toolchain`.
 ## Build / run / verify
 
 ```bash
-lake build       # builds the libraries and the demo executable
-lake exe wasminterpreterlean   # runs the example programs end-to-end
+lake build       # builds the libraries and executables
 ```
 
 There is no separate test runner. Example correctness is encoded as Lean theorems and `native_decide` checks inside the examples; a successful `lake build` means every proof and decidable example check passed. To check a single source file in isolation: `lake env lean <path>`.
@@ -29,22 +28,15 @@ Three layers, deliberately small and currently i32-only:
 
 ## Public spec API: don't expose fuel
 
-`run` takes an explicit `fuel : Nat` so that it terminates syntactically, but fuel is a proof obligation, not part of what a wasm function "does". User-facing specs should never mention fuel — no `∃ fuel, run … fuel = some rs` and no fixed numeric fuel in the statement. Use the fuel-free predicates from `WasmInterpreterLean/Spec/Termination.lean` instead:
+`run` takes an explicit `fuel : Nat` so that it terminates syntactically, but fuel is a proof obligation, not part of what a wasm function "does". User-facing specs should never mention fuel — no `∃ fuel, run … fuel = some rs` and no fixed numeric fuel in the statement. Use the fuel-free predicates from `Interpreter/Wasm/Spec/Termination.lean` instead:
 
 - `Wasm.TerminatesWith m entry args P` — total correctness (some fuel succeeds, result satisfies `P`). Discharge via `TerminatesWith.of_run` / `of_run_eq` by exhibiting a concrete fuel internally.
 - `Wasm.PartiallyMeets m entry args P` — partial correctness (every terminating fuel-bounded run satisfies `P`).
 
 When writing or updating a `@[wasm_spec]` theorem, reach for these — the fuel value belongs inside the proof, not the statement.
 
-## Examples: two layouts
+## Examples
 
-Examples live in two places, with different roles:
+Examples live in `Interpreter/Wasm/Examples/`. Each file defines a hand-built Wasm module and proves theorems about it using the WP tactic layer. The standard pattern: state the property, apply `wp_run` to reduce to a concrete computation, then close with `simp` / `omega` / domain lemmas. New examples should follow this pattern.
 
-- `Examples/Lean/` — small, hand-written Lean modules (e.g. `IsEven`, `IsOdd`, `SumTo`, `Factorial`, `Decoded`, `Spec/Bootstrap`). Each defines its `Wasm.Module` by hand and proves theorems against it. These are the simple, self-contained examples; they exercise the i32 interpreter directly and are imported from the top-level `WasmInterpreterLean.lean` library so they get built alongside the core.
-- `Examples/programs/` — larger end-to-end examples driven by the `verifier` pipeline (Rust → wasm → WAT → Lean). Each one is its own Lake subproject with a `rust/` crate and a `lean/` project containing auto-generated `Program.lean` plus hand-written `Spec.lean` / `Proofs.lean`. Use this layout when the example is non-trivial enough to be worth writing in Rust, or when you want it surfaced in the `verifier ui` dashboard.
-
-New work usually goes in `Examples/programs/`. Reach for `Examples/Lean/` only when you need a tight, hand-rolled module to exercise a specific interpreter feature.
-
-## Planning notes
-
-Active design notes for in-progress work live in `tasks/`. See `tasks/CLAUDE.md` for the ground rules — those files are human-curated and shouldn't be edited by agents without an explicit ask.
+`Interpreter/Wasm/Examples/Factorial.lean` is a good reference: it proves a full loop invariant correctness theorem with a WP-based loop rule.

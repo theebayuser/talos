@@ -1,5 +1,13 @@
 import Interpreter.Wasm.Syntax
 
+/-!
+# Local variables and call-frame state
+
+Defines `Locals` — the per-invocation frame holding parameter slots, local
+variable slots, and the operand stack — together with indexed get/set
+operations used by the interpreter.
+-/
+
 namespace Wasm
 
 /-- Per-call frame: parameter slots, non-param local slots, and the operand

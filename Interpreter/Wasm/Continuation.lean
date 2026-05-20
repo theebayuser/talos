@@ -1,6 +1,16 @@
 import Interpreter.Wasm.Syntax
 import Interpreter.Wasm.Locals
 
+/-!
+# Continuation and Result types
+
+`Continuation` is the outcome of a single instruction or block evaluation:
+the interpreter returns one of these at every step and callers pattern-match
+on it to decide how to continue. `Result` is the coarser outcome reported to
+the caller of `run` — it collapses the in-flight control-flow variants
+(`Fallthrough`, `Break`, `Return`) into a single `Success`.
+-/
+
 namespace Wasm
 
 inductive Continuation where

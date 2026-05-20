@@ -1,4 +1,11 @@
-programs_dir := justfile_directory() / "Examples/programs"
+# Generate HTML documentation and serve it at http://localhost:8080
+docs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd "{{justfile_directory()}}/docbuild"
+    lake build Interpreter:docs
+    echo "Serving docs at http://localhost:8080 (Ctrl-C to stop)"
+    python3 -m http.server 8080 --directory .lake/build/doc
 
 # Run the WebAssembly spec testsuite (vendor/testsuite/). Optional pattern
 # is a case-sensitive substring on the .wast filename stem.
@@ -10,55 +17,6 @@ testsuite pattern="":
     else
         lake exe testsuite
     fi
-
-# List all example programs
-list:
-    @ls {{programs_dir}}
-
-# Build the Lean proofs for one program (or all if name omitted)
-build name="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -n "{{name}}" ]]; then
-        targets=("{{name}}")
-    else
-        targets=($(ls "{{programs_dir}}"))
-    fi
-    for p in "${targets[@]}"; do
-        echo "==> build $p"
-        (cd "{{programs_dir}}/$p/lean" && lake build)
-    done
-
-# Run `lake exe verifier check` for one program (or all if name omitted)
-check name="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -n "{{name}}" ]]; then
-        targets=("{{name}}")
-    else
-        targets=($(ls "{{programs_dir}}"))
-    fi
-    for p in "${targets[@]}"; do
-        echo "==> check $p"
-        (cd "{{programs_dir}}/$p/lean" && lake exe verifier check)
-    done
-
-# Build the UI for one program (or all if name omitted)
-ui name="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [[ -n "{{name}}" ]]; then
-        targets=("{{name}}")
-    else
-        targets=($(ls "{{programs_dir}}"))
-    fi
-    for p in "${targets[@]}"; do
-        echo "==> ui $p"
-        (cd "{{programs_dir}}/$p/lean" && lake exe verifier build && lake exe verifier ui)
-    done
-
-# Build + check (default: all programs, useful for CI)
-verify name="": (build name) (check name)
 
 # Smoke-test `./.lake/build/bin/runner` against samples/.
 runner-smoke:
