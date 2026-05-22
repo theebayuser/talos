@@ -13,6 +13,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: leanprover/lean-action@v1
+        with:
+          working-directory: interpreter
+      - name: Build codelib and programs
+        run: |
+          lake -d codelib build
+          lake -d programs build
 
   test:
     name: Smoke test & spec testsuite
@@ -28,6 +34,7 @@ jobs:
         # just the two executables, which are instant to verify from the restored cache.
       - uses: leanprover/lean-action@v1
         with:
+          working-directory: interpreter
           build-args: runner testsuite
           use-mathlib-cache: true
       - name: Install just
