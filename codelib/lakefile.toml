@@ -1,0 +1,10 @@
+name = "CodeLib"
+version = "0.1.0"
+defaultTargets = ["CodeLib"]
+
+[[require]]
+name = "WasmInterpreterLean"
+path = "../interpreter"
+
+[[lean_lib]]
+name = "CodeLib"

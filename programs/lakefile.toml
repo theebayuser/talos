@@ -1,0 +1,10 @@
+name = "Programs"
+version = "0.1.0"
+defaultTargets = ["Programs"]
+
+[[require]]
+name = "CodeLib"
+path = "../codelib"
+
+[[lean_lib]]
+name = "Programs"

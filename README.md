@@ -26,6 +26,7 @@ Proofs in Talos are built on **weakest precondition (WP) calculus** — a [predi
 **Run a `.wat` module:**
 
 ```
+cd interpreter
 lake exe runner samples/factorial.wat fact 5
 ```
 
@@ -37,21 +38,62 @@ Output: `120`
 lake exe runner --fuel 10000 samples/factorial.wat fact 5
 ```
 
-See [`samples/factorial.wat`](samples/factorial.wat) for a minimal example module.
+See [`interpreter/samples/factorial.wat`](interpreter/samples/factorial.wat) for a minimal example module.
 
 **Prove something about it:**
 
-[`Interpreter/Wasm/Examples/Factorial.lean`](Interpreter/Wasm/Examples/Factorial.lean) shows a complete correctness proof using the WP tactic layer.
+[`interpreter/Interpreter/Wasm/Examples/Factorial.lean`](interpreter/Interpreter/Wasm/Examples/Factorial.lean) shows a complete correctness proof using the WP tactic layer.
+
+## Repository layout
+
+Three Lake packages in a monorepo, forming a strict dependency chain:
+
+| Package | Path | Purpose |
+|---------|------|---------|
+| `Interpreter` | `interpreter/` | Wasm AST, semantics, WP tactic layer |
+| `CodeLib` | `codelib/` | Lifting lemmas and program-reasoning helpers |
+| `Programs` | `programs/` | Concrete Rust-to-Wasm verification tasks |
+
+## Using as a dependency
+
+**Depend on the interpreter only** (Wasm semantics + WP calculus):
+
+```toml
+# lakefile.toml
+[[require]]
+name = "WasmInterpreterLean"
+scope = "your-org"           # if published, or use path/git
+path = "path/to/repo/interpreter"
+```
+
+**Depend on CodeLib** (adds lifting lemmas and reasoning helpers on top):
+
+```toml
+[[require]]
+name = "CodeLib"
+path = "path/to/repo/codelib"
+```
+
+Code that imports `CodeLib` never needs to import the interpreter directly —
+`CodeLib` re-exports the parts of the interpreter that downstream proofs need.
 
 ## Building
 
 ```bash
-lake build
+just build   # builds interpreter → codelib → programs in order
+```
+
+Or build a single package:
+
+```bash
+cd interpreter && lake build
+cd codelib     && lake build
+cd programs    && lake build
 ```
 
 Dependencies:
 
-- **Lean 4** — toolchain pinned in `lean-toolchain`, fetched automatically by [`elan`](https://github.com/leanprover/elan).
+- **Lean 4** — toolchain pinned in `interpreter/lean-toolchain`, fetched automatically by [`elan`](https://github.com/leanprover/elan).
 - **[`wasm-tools`](https://github.com/bytecodealliance/wasm-tools)** — needed to decode `.wasm` binaries and to run the Wasm testsuite. `brew install wasm-tools` or `cargo install wasm-tools`.
 
 ## Running the Wasm testsuite

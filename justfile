@@ -1,3 +1,9 @@
+# Build all three packages in dependency order
+build:
+    lake -d {{justfile_directory()}}/interpreter build
+    lake -d {{justfile_directory()}}/codelib     build
+    lake -d {{justfile_directory()}}/programs    build
+
 # Generate HTML documentation and serve it at http://localhost:8080
 docs:
     #!/usr/bin/env bash
@@ -12,17 +18,18 @@ docs:
 testsuite pattern="":
     #!/usr/bin/env bash
     set -euo pipefail
+    cd "{{justfile_directory()}}/interpreter"
     if [[ -n "{{pattern}}" ]]; then
         lake exe testsuite "{{pattern}}"
     else
         lake exe testsuite
     fi
 
-# Smoke-test `./.lake/build/bin/runner` against samples/.
+# Smoke-test the runner executable against samples/.
 runner-smoke:
     #!/usr/bin/env bash
     set -euo pipefail
-    cd "{{justfile_directory()}}"
+    cd "{{justfile_directory()}}/interpreter"
     lake build runner
 
     fail=0

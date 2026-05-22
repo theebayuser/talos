@@ -10,9 +10,26 @@ The interpreter is deliberately optimized for **simplicity of reasoning, not exe
 
 Lean toolchain is pinned in `lean-toolchain`.
 
+## Repository layout
+
+Three Lake packages in a monorepo, forming a strict dependency chain:
+
+```
+interpreter/   ← Wasm AST, semantics, WP tactic layer  (Lake package: Interpreter)
+codelib/       ← lifting lemmas and reasoning helpers   (Lake package: CodeLib)
+programs/      ← concrete Rust-to-Wasm verification     (Lake package: Programs)
+```
+
+`programs/rust/` holds the Rust source crates; `programs/Programs/` holds the
+generated `Program.lean` files and hand-written `Spec.lean` / `Proofs.lean`.
+
+Dependency direction: `interpreter` → `codelib` → `programs`. Downstream code
+imports `CodeLib`, never the interpreter directly.
+
 ## Build / run / verify
 
 ```bash
+# from each package directory:
 lake build       # builds the libraries and executables
 ```
 
@@ -37,6 +54,6 @@ When writing or updating a `@[wasm_spec]` theorem, reach for these — the fuel 
 
 ## Examples
 
-Examples live in `Interpreter/Wasm/Examples/`. Each file defines a hand-built Wasm module and proves theorems about it using the WP tactic layer. The standard pattern: state the property, apply `wp_run` to reduce to a concrete computation, then close with `simp` / `omega` / domain lemmas. New examples should follow this pattern.
+Examples live in `interpreter/Interpreter/Wasm/Examples/`. Each file defines a hand-built Wasm module and proves theorems about it using the WP tactic layer. The standard pattern: state the property, apply `wp_run` to reduce to a concrete computation, then close with `simp` / `omega` / domain lemmas. New examples should follow this pattern.
 
 `Interpreter/Wasm/Examples/Factorial.lean` is a good reference: it proves a full loop invariant correctness theorem with a WP-based loop rule.

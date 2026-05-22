@@ -3,6 +3,7 @@
 docbuild/.lake
 Examples/rust/*/build/
 Examples/rust/*/rust/target/
+programs/rust/**/target/
 target/
 
 comment.txt
