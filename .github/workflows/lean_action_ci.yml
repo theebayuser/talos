@@ -15,10 +15,12 @@ jobs:
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: interpreter
-      - name: Build codelib and programs
-        run: |
-          lake -d codelib build
-          lake -d programs build
+      - name: Build codelib
+        working-directory: codelib
+        run: lake build
+      - name: Build programs
+        working-directory: programs
+        run: lake build
 
   test:
     name: Smoke test & spec testsuite
