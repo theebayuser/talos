@@ -15,6 +15,7 @@ jobs:
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: programs
+          use-mathlib-cache: true
 
   test:
     name: Smoke test & spec testsuite
@@ -24,10 +25,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: true
-        # lean-action caches .lake keyed by {OS}-{arch}-{toolchain}-{lake-manifest}-{SHA}.
-        # The test job runs on the same SHA, so it gets an exact hit from the build job's
-        # saved cache — all oleans are already present. build-args limits lake build to
-        # just the two executables, which are instant to verify from the restored cache.
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: interpreter
