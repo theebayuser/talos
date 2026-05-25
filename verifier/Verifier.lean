@@ -1,2 +1,2 @@
-import Verifier.EmitMini
-import Verifier.TomlMini
+import Verifier.Emit
+import Verifier.Toml
