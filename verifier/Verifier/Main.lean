@@ -61,9 +61,12 @@ private def strCapitalise (s : String) : String :=
 
 private def usage : String :=
   "Usage:\n" ++
-  "  lake exe verifier new        <rust-path> <lean-path> <subfolder>\n" ++
+  "  lake exe verifier new        <rust-path> <lean-path> <subfolder> [--codelib <path>]\n" ++
   "  lake exe verifier check      [path] [--no-build]\n" ++
-  "  lake exe verifier report     [--out <dir>] [--no-build]"
+  "  lake exe verifier report     [--out <dir>] [--no-build]\n\n" ++
+  "Codelib discovery (for `new`, when not given --codelib): override by\n" ++
+  "TALOS_CODELIB env var, then walks up from the verifier executable's\n" ++
+  "install dir, then walks up from cwd."
 
 private def die (msg : String) : IO α := do
   IO.eprintln msg
@@ -190,14 +193,58 @@ def subfolderToModule (sub : String) : String :=
   let parts := (sub.splitOn "/").filter (·.length > 0)
   String.intercalate "." parts
 
-private def codelibLeanToolchain : IO String := do
-  let candidates : List FilePath :=
-    [ "codelib/lean-toolchain", "../codelib/lean-toolchain",
-      "interpreter/lean-toolchain", "../interpreter/lean-toolchain" ]
-  for c in candidates do
-    if ← System.FilePath.pathExists c then
-      return (← IO.FS.readFile c)
-  die "could not locate lean-toolchain (looked in codelib/ and interpreter/)"
+/-- Walk up from `start` looking for a directory containing a
+`codelib/lean-toolchain`. Stops at the filesystem root. -/
+private partial def walkUpFor (marker : FilePath) (start : FilePath) :
+    IO (Option FilePath) := do
+  let mut cur := start
+  for _ in [:64] do
+    if ← System.FilePath.pathExists (cur / marker) then
+      return some cur
+    match cur.parent with
+    | some p => if p = cur then break else cur := p
+    | none   => break
+  pure none
+
+/-- Resolve the path to `codelib/`. In order:
+
+1. `override` (CLI flag).
+2. The `TALOS_CODELIB` env var.
+3. Walk up from the verifier executable's install location — this
+   covers the common case of running the binary from anywhere on
+   disk while having Talos checked out somewhere.
+4. Walk up from the current working directory. -/
+private def resolveCodelib (override : Option FilePath) : IO FilePath := do
+  let tryDir (d : FilePath) : IO (Option FilePath) := do
+    if ← System.FilePath.pathExists (d / "lean-toolchain") then
+      pure (some (← absNormalize d))
+    else pure none
+  if let some d := override then
+    match ← tryDir d with
+    | some r => return r
+    | none   => die s!"--codelib {d}: no `lean-toolchain` here"
+  if let some env ← IO.getEnv "TALOS_CODELIB" then
+    match ← tryDir ⟨env⟩ with
+    | some r => return r
+    | none   => die s!"TALOS_CODELIB={env}: no `lean-toolchain` here"
+  let exePath ← IO.appPath
+  if let some exeDir := exePath.parent then
+    if let some root ← walkUpFor "codelib/lean-toolchain" exeDir then
+      return ← absNormalize (root / "codelib")
+  let cwd ← IO.currentDir
+  if let some root ← walkUpFor "codelib/lean-toolchain" cwd then
+    return ← absNormalize (root / "codelib")
+  die <| String.intercalate "\n" [
+    "could not locate `codelib/`. Tried, in order:",
+    "  --codelib <path>",
+    "  TALOS_CODELIB env var",
+    s!"  walking up from {exePath}",
+    s!"  walking up from {cwd}",
+    "Pass `--codelib <path>` to point at your Talos checkout's codelib/."
+  ]
+
+private def codelibLeanToolchain (codelibDir : FilePath) : IO String :=
+  IO.FS.readFile (codelibDir / "lean-toolchain")
 
 private def resolvePairFromRust (rustDir : FilePath) : IO Pair := do
   let v ← Toml.readVerifier (rustDir / "verifier.toml")
@@ -279,15 +326,8 @@ private def appendImportLine (rootFile : FilePath) (importLine : String) : IO Un
   let trailing := if existing.isEmpty || existing.endsWith "\n" then "" else "\n"
   IO.FS.writeFile rootFile (existing ++ trailing ++ importLine ++ "\n")
 
-private def codelibSourceDir : IO FilePath := do
-  let candidates : List FilePath := ["codelib", "../codelib", "./"]
-  for c in candidates do
-    if ← System.FilePath.pathExists (c / "lean-toolchain") then
-      return (← absNormalize c)
-  die "could not locate `codelib/` next to invocation directory"
-
 private def scaffoldLeanProject (leanDir : FilePath) (codelibDir : FilePath) : IO Unit := do
-  let toolchain ← codelibLeanToolchain
+  let toolchain ← codelibLeanToolchain codelibDir
   let pkgName :=
     match leanDir.fileName with
     | some s => if s.isEmpty then "Verification" else strCapitalise s
@@ -356,19 +396,20 @@ private def proofsStub (subfolder : String) : String :=
     ""
   ]
 
-private def cmdNew (rustPathIn leanPathIn subfolder : String) : IO Unit := do
+private def cmdNew (rustPathIn leanPathIn subfolder : String)
+    (codelibOverride : Option String) : IO Unit := do
   let rustDir ← absNormalize rustPathIn
   let leanDir ← absNormalize leanPathIn
   let cargoToml := rustDir / "Cargo.toml"
   unless ← System.FilePath.pathExists cargoToml do
     die s!"{rustDir}: no Cargo.toml here (verifier does not scaffold rust crates)"
   -- 1. Lean project: scaffold if missing.
-  let codelib ← codelibSourceDir
+  let codelib ← resolveCodelib (codelibOverride.map (⟨·⟩))
   if ¬ (← System.FilePath.pathExists (leanDir / "lakefile.toml")) then
-    IO.println s!"==> scaffolding lean project at {leanDir}"
+    IO.println s!"==> scaffolding lean project at {leanDir} (using codelib at {codelib})"
     scaffoldLeanProject leanDir codelib
   else
-    let expected ← codelibLeanToolchain
+    let expected ← codelibLeanToolchain codelib
     let actual ← IO.FS.readFile (leanDir / "lean-toolchain")
     if strTrim expected ≠ strTrim actual then
       die s!"{leanDir}/lean-toolchain disagrees with {codelib}/lean-toolchain:\n  expected: {strTrim expected}\n  actual:   {strTrim actual}"
@@ -670,10 +711,22 @@ private def parseReportArgs (args : List String) : Option String × Bool :=
     | []                => none
   (findOut args, args.contains "--no-build")
 
+/-- Pull out `--<flag> <value>` from a string list, returning the value
+(if present) and the args with that pair removed. -/
+private def stripFlagValue (flag : String) :
+    List String → Option String × List String
+  | f :: v :: rest =>
+    if f = flag then (some v, rest)
+    else
+      let (got, rest') := stripFlagValue flag (v :: rest)
+      (got, f :: rest')
+  | rest => (none, rest)
+
 def main (args : List String) : IO UInt32 := do
+  let (codelib, args) := stripFlagValue "--codelib" args
   match args with
   | "new"   :: rust :: lean :: sub :: [] =>
-    cmdNew rust lean sub; pure 0
+    cmdNew rust lean sub codelib; pure 0
   | "check" :: rest =>
     let (path, skipBuild) := parseCheckArgs rest
     -- Reject if more than one positional was supplied.
