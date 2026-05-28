@@ -6,7 +6,7 @@ import CodeLib
 
 set_option maxRecDepth 1048576
 
-namespace Programs.Simple.IsEven
+namespace Project.IsEven
 
 open Wasm
 
@@ -35,4 +35,4 @@ def «module» : Wasm.Module :=
   ]
 }
 
-end Programs.Simple.IsEven
+end Project.IsEven

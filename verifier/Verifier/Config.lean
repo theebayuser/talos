@@ -102,6 +102,22 @@ def readVerifier (path : System.FilePath) : IO VerifierToml := do
     build := { command := cmd, artifact := art }
   }
 
+/-- Parse `verifier.toml` permissively: every field is optional. This is
+the form `verifier new` writes (an empty file is valid). -/
+def readVerifierOptional (path : System.FilePath) : IO VerifierToml := do
+  let txt ← IO.FS.readFile path
+  let t ← match Verifier.Toml.parse txt with
+    | .ok t   => pure t
+    | .error e => throw (IO.userError s!"{path}: {e}")
+  pure {
+    leanProject := (Verifier.Toml.get? t "lean_project").getD "",
+    verificationFolder := (Verifier.Toml.get? t "verification_folder").getD "",
+    build := {
+      command := Verifier.Toml.get? t "build_command",
+      artifact := Verifier.Toml.get? t "build_artifact"
+    }
+  }
+
 /-- Parse and validate `origin.toml`. -/
 def readOrigin (path : System.FilePath) : IO OriginToml := do
   let txt ← IO.FS.readFile path

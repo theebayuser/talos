@@ -1,10 +1,10 @@
 # verifier
 
-A small Lean CLI that drives the Rust → wasm → Lean verification loop
-for projects in this repo. Given a Rust crate and a sibling Lean
-subfolder, it builds the wasm binary, emits a `Program.lean`
-translation, runs `lake build`, extracts symbols from both sides, and
-(optionally) renders an interactive HTML report.
+A small Lean CLI that drives the Rust → wasm → Lean verification loop.
+`verifier new <path>` scaffolds a fixed-shape project from a bundled
+template (a Cargo workspace + a Lean project); `verifier check` builds
+every crate to wasm, decodes it into a Lean `Program.lean`, and runs
+`lake build`.
 
 ## Build
 
@@ -15,174 +15,217 @@ lake build       # produces .lake/build/bin/verifier
 
 ## Project layout
 
-Each verified item is a pair of directories:
+`verifier` is convention-driven — there are no `verifier.toml` /
+`origin.toml` files. Every project has the same fixed shape:
 
 ```
 project/
   rust/
-    foo/
+    Cargo.toml                ← cargo workspace
+    .cargo/config.toml        ← `cargo build-wasm` alias
+    is_even/
       Cargo.toml
+      src/lib.rs              ← `pub fn is_even(...) -> bool { ... }`
+      src/exports.rs          ← `#[unsafe(no_mangle)] pub extern "C" fn is_even`
+    is_odd/
+      Cargo.toml              ← depends on `is_even` (path = "../is_even")
       src/lib.rs
-      verifier.toml         ← points at the Lean side
-  Project/
-    Foo/
-      origin.toml           ← points back at the Rust side
-      Spec.lean             ← `def MyProp : Prop := …` statements
-      Proofs.lean           ← `theorem _ : MyProp := …` proofs
-      Program.lean          ← auto-generated, do not edit
-      module.wat            ← auto-generated
-    Project.lean            ← the umbrella library root
-  lakefile.toml             ← one umbrella Lean project per repo
+      src/exports.rs
+    build/
+      is_even/{program.wasm, program.wat}   ← produced by `verifier check`
+      is_odd/{program.wasm, program.wat}
+  lean/
+    lakefile.toml             ← name = "Project", CodeLib as a git dep
+    lean-toolchain            ← matches the verifier's own toolchain
+    Project.lean              ← imports each `Project.<Crate>.Proof`
+    Project/
+      IsEven/
+        Program.lean          ← auto-generated from build/is_even/program.wasm
+        Spec.lean             ← `def MyProp : Prop := …` statements
+        Proof.lean            ← `theorem _ : MyProp := …` proofs
+      IsOdd/
+        Program.lean
+        Spec.lean
+        Proof.lean
 ```
 
-`verifier.toml` (minimal):
+The rust↔lean mapping is by name: crate `foo_bar` ↔ Lean module
+`Project.FooBar` (snake_case → PascalCase). If a Lean module dir is
+missing for a crate, `verifier check` errors out — the shape is fixed.
+
+## Setting up a Rust crate for wasm
+
+The bundled template already does this for you; this section explains
+the conventions in case you add more crates by hand.
+
+**`Cargo.toml`** — declare a `cdylib` crate so the wasm output is a
+freestanding module:
 
 ```toml
-lean_project = "../../.."
-verification_folder = "Project/Foo"
-# Optional:
-# build_command  = "cargo build --release --target wasm32-unknown-unknown"
-# build_artifact = "target/wasm32-unknown-unknown/release/{crate}.wasm"
+[package]
+name    = "foo"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 ```
+
+The workspace-root `Cargo.toml` keeps the release profile small so the
+emitted wasm stays decoder-friendly:
+
+```toml
+[profile.release]
+opt-level = "s"
+lto       = true
+```
+
+**`rust/.cargo/config.toml`** — a `build-wasm` alias so you don't have
+to re-type the target every time. Lives at the workspace root, not
+inside individual crates:
+
+```toml
+[alias]
+build-wasm = "build --release --target wasm32-unknown-unknown"
+```
+
+After this `cargo build-wasm` (run from `rust/`) produces every member
+crate's wasm under `target/wasm32-unknown-unknown/release/<crate>.wasm`.
+`verifier check` invokes this command and then copies each output into
+`rust/build/<crate>/program.wasm`.
+
+**`src/exports.rs`** — the single module that pins the public surface
+the verifier reasons about. Every function the verifier should see
+lives here, marked `#[unsafe(no_mangle)] pub extern "C"`:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn is_even(n: i32) -> bool {
+    crate::is_even(n)
+}
+```
+
+**`src/lib.rs`** — the public Rust API (kept separate from the C-ABI
+wrappers so Rust callers and verifier-visible exports stay distinct):
+
+```rust
+mod exports;
+
+pub fn is_even(n: i32) -> bool {
+    n % 2 == 0
+}
+```
+
+Keeping exports in their own file means the wasm export table matches
+exactly what's listed in `exports.rs`, which is the surface area
+`Spec.lean` writes properties against.
 
 ## Tutorial
 
 ### 1. Bootstrap a new project
 
-You wrote a Rust crate at `rust/foo/` and want a Lean verification
-subfolder at `Project/Foo`:
-
 ```bash
-lake exe verifier new rust/foo Project Foo
+lake exe verifier new my-project
 ```
 
-This scaffolds:
-- `rust/foo/verifier.toml` pointing at `../../Project` with subfolder `Foo`.
-- `Project/Foo/origin.toml` pointing back at `rust/foo`.
-- `Project/Foo/Spec.lean` — empty stub with the `def MyProp : Prop` pattern.
-- `Project/Foo/Proofs.lean` — empty stub with the `theorem _ : MyProp := …` pattern.
-- `import Project.Foo.Proofs` appended to `Project.lean` (creates the file if missing).
+`<path>` must not exist (or must be empty). This:
 
-If `Project/` doesn't exist yet, `verifier new` also scaffolds the
-umbrella Lean project (lakefile.toml, lean-toolchain copied from
-`codelib/`, library root file).
+1. Copies the bundled template (cargo workspace with `is_even` and
+   `is_odd`, plus a Lean `Project` lib) into `my-project/`.
+2. Runs `cargo check` inside `my-project/rust/`.
+3. Runs an initial `lake build` inside `my-project/lean/` to fetch
+   CodeLib and warm caches.
 
-### 2. Build + check one project
+Once it returns, you have a fully working example you can edit in
+place — add a function in `rust/<crate>/src/lib.rs`, mirror it in
+`exports.rs`, and re-run `verifier check`.
 
-```bash
-lake exe verifier check rust/foo
-```
-
-Pipeline:
-1. `cargo build --release --target wasm32-unknown-unknown` (or the
-   `build_command` from `verifier.toml`).
-2. `wasm-tools strip --all` then `wasm-tools print` → `Project/Foo/module.wat`.
-3. In-process wat → `Wasm.Module` decoder → write `Project/Foo/Program.lean`.
-4. `lake build` on the umbrella project.
-5. Run the symbol extractor; write `Project/Foo/.verifier-extract.json`.
-
-Add `--no-build` to skip steps 4–5 when you're iterating on the Rust
-side and don't need the Lean parts re-checked.
-
-### 3. Check everything at once
-
-Run with no path argument from anywhere under the repo root:
+### 2. Build + verify
 
 ```bash
+cd my-project
 lake exe verifier check
 ```
 
-This walks the cwd looking for every `verifier.toml` (pruning `target/`,
-`.lake/`, `.git/`, …), groups the discovered crates by their umbrella
-Lean project, and runs the pipeline once per crate with **one**
-`lake build` per umbrella. Errors are collected and printed in a
-summary at the end — one bad project doesn't stop the others.
+This **must** be run from the project root (the directory containing
+`rust/` and `lean/`).
 
-### 4. Generate the HTML report
+Pipeline:
 
-```bash
-lake exe verifier report                    # writes ./verifier-report/
-lake exe verifier report --out my-report    # custom output dir
-lake exe verifier report --no-build         # skip lake build (rust-only view)
-```
+1. `cargo build-wasm` in `rust/` — builds every workspace member.
+2. For each crate:
+   - Copy `target/wasm32-unknown-unknown/release/<crate>.wasm` to
+     `rust/build/<crate>/program.wasm` (only writes when bytes change,
+     so re-runs are idempotent).
+   - `wasm-tools print` → `rust/build/<crate>/program.wat`.
+   - If the wasm is newer than `lean/Project/<Crate>/Program.lean` (or
+     `--force-emit`), decode the wat in-process and re-emit
+     `Program.lean`.
+3. One `lake build` in `lean/`.
+4. Summary line: crate count, `lake build` status, `sorry` count.
 
-The report directory is self-contained:
+### 3. Adding a crate
 
-```
-verifier-report/
-  index.html                                  ← project list
-  project/<slug>.html                         ← per-project view
-  source/<slug>/{rust,lean}/<rel>.html        ← syntax-highlighted source files
-  assets/site.css
-```
+1. `mkdir rust/foo_bar && …` — write `Cargo.toml`, `src/lib.rs`,
+   `src/exports.rs` following the conventions above.
+2. Add `"foo_bar"` to the `members` list in `rust/Cargo.toml`.
+3. Create `lean/Project/FooBar/{Program,Spec,Proof}.lean` (you can
+   copy the `IsEven` ones as a starting point).
+4. Add `import Project.FooBar.Proof` to `lean/Project.lean`.
+5. `lake exe verifier check`.
 
-Per-project pages render rust exports, formal specs (`def X : Prop`),
-proofs (linked to specs by head-symbol match), and standalone theorems.
-Source pages use highlight.js loaded from a CDN — opening the report
-needs internet the first time; cache it after that.
-
-### 5. Writing specs and proofs
+### 4. Writing specs and proofs
 
 `Spec.lean` (statements as `def : Prop`):
 
 ```lean
-import Project.Foo.Program
+import Project.IsEven.Program
 
-namespace Project.Foo.Spec
+namespace Project.IsEven.Spec
 open Wasm
 
-/-- The exported `foo` function returns its input unchanged. -/
-def FooIsIdentity : Prop :=
+/-- The exported `is_even` returns 1 for even inputs and 0 otherwise. -/
+def IsEvenSpec : Prop :=
   ∀ (initial : Store) (n : UInt32),
-    TerminatesWith «module» 0 initial [.i32 n] (fun _ rs => rs = [.i32 n])
+    TerminatesWith «module» 0 initial [.i32 n]
+      (fun _ rs => rs = [.i32 (if n.toNat % 2 = 0 then 1 else 0)])
 
-end Project.Foo.Spec
+end Project.IsEven.Spec
 ```
 
-`Proofs.lean` (theorems that close those statements):
+`Proof.lean` (theorems that close those statements):
 
 ```lean
-import Project.Foo.Spec
+import Project.IsEven.Spec
 
-namespace Project.Foo.Proofs
-open Project.Foo.Spec
+namespace Project.IsEven.Proof
+open Project.IsEven.Spec
 
-theorem foo_is_identity : FooIsIdentity := by
+theorem is_even_spec : IsEvenSpec := by
   intro initial n
   -- … your proof …
 
-end Project.Foo.Proofs
+end Project.IsEven.Proof
 ```
-
-The extractor links `foo_is_identity` to `FooIsIdentity` automatically
-because the theorem's conclusion (after stripping `∀`-binders) has
-head symbol `FooIsIdentity`. The report shows them side-by-side with
-a `proved` badge.
-
-Theorems whose conclusion isn't a known `def : Prop` — e.g. the
-"theorem-with-inline-Prop" style used by some existing projects — are
-still surfaced under **Standalone proofs**, so you don't have to
-refactor existing code to see it in the report.
 
 ## Commands
 
 ```
-verifier new    <rust-path> <lean-path> <subfolder> [--codelib <path>]
-verifier check  [path] [--no-build]
-verifier report [--out <dir>] [--no-build]
+verifier new   <project-path>
+verifier check [--force-emit]
+verifier report                  (stub — not implemented)
 ```
 
-- `path` for `check` is optional. Without it, every `verifier.toml`
-  under cwd is processed.
-- `verifier new` is the only command that doesn't require an existing
-  `verifier.toml` (it creates the first one).
+- `verifier new` requires a non-existent or empty target directory.
+- `verifier check` must be run from the project root.
+- `--force-emit` re-emits every `Program.lean` even when its
+  corresponding `program.wasm` hasn't changed.
 
-### CodeLib source (for `new`)
+### CodeLib source
 
-Scaffolding writes a `lakefile.toml` that requires the `CodeLib`
-package (the wasm interpreter + `wp` tactic your specs build on).
-By default the scaffold points at the public GitHub remote so the
-new project is self-contained — no Talos checkout needed on disk:
+The bundled `lakefile.toml` requires `CodeLib` (the Wasm interpreter +
+`wp` tactic your specs build on) from the public Talos GitHub remote,
+so a freshly scaffolded project is self-contained:
 
 ```toml
 [[require]]
@@ -192,43 +235,9 @@ subDir = "codelib"
 rev = "main"
 ```
 
-The matching `lean-toolchain` is fetched live from
-`raw.githubusercontent.com` during `verifier new` (one `curl`).
-
-Overrides:
-
-- `--codelib-rev <rev>` — pin a specific commit/tag instead of `main`
-  for reproducibility.
-- `--codelib <path>` — use a local checkout (writes `path = "..."`
-  in the lakefile). Useful when developing Talos itself.
-- `TALOS_CODELIB` env var — same as `--codelib`.
-
-`--codelib` and `TALOS_CODELIB` both require the path to contain a
-`lean-toolchain` file.
-
-## Sidecar JSON
-
-After every `check`, each project writes
-`<lean-subfolder>/.verifier-extract.json` (gitignored). Shape:
-
-```json
-{
-  "project": { "rustDir": "...", "leanDir": "...", "subfolder": "...", "crate": "..." },
-  "buildOk": true,
-  "rustExports": [
-    { "name": "foo", "signature": "pub extern \"C\" fn foo(...) -> ...",
-      "doc": "...", "file": "src/lib.rs", "line": 12 }
-  ],
-  "lean": {
-    "namespace": "Project.Foo",
-    "specs":  [{ "name": "...", "statement": "...", "doc": "..." }],
-    "proofs": [{ "name": "...", "proves": "...", "type": "...", "doc": "..." }]
-  }
-}
-```
-
-This is the documented integration point for downstream tooling — the
-report consumes it, and so can anything else.
+The matching `lean-toolchain` is baked into the verifier binary at
+compile time (from `verifier/lean-toolchain`) and copied into every new
+project.
 
 ## Tooling required
 
