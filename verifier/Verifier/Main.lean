@@ -280,10 +280,19 @@ private def cmdNew (projectPathIn : String) : IO Unit := do
     writeFile (projectDir / rel) content
   IO.println "==> cargo check"
   runOrDie "cargo" #["check"] (cwd := some (projectDir / "rust"))
+  -- Fetch lean deps (CodeLib pulls in mathlib) and prime the mathlib
+  -- olean cache before building. Doing this here, instead of relying on
+  -- the implicit fetch inside `lake build`, lets us pick up cached
+  -- mathlib oleans and skip a multi-minute recompile.
+  let leanDir := projectDir / "lean"
+  IO.println "==> lake update"
+  runOrDie "lake" #["update"] (cwd := some leanDir)
+  IO.println "==> lake exe cache get"
+  runOrDie "lake" #["exe", "cache", "get"] (cwd := some leanDir)
   -- Hand off to the full check pipeline: it builds wasm, emits the real
-  -- Program.lean for every crate, then runs `lake build` (which on a
-  -- fresh project also fetches CodeLib/mathlib). The bundled Proof.lean
-  -- files reference `func0` etc., so we can't skip emit before building.
+  -- Program.lean for every crate, then runs `lake build`. The bundled
+  -- Proof.lean files reference `func0` etc., so we can't skip emit
+  -- before building.
   IO.println "==> running initial `verifier check`"
   unless ← checkAt projectDir false do
     die "initial `verifier check` failed"
