@@ -96,10 +96,16 @@ def func0 : Wasm.Program :=
 def «module» : Wasm.Module :=
 {
   funcs := [
-    { params := [.i64, .i64], locals := [.i64, .i64], body := func0 }
+    { params := [.i64, .i64], locals := [.i64, .i64], body := func0, results := some [.i64] }
   ],
   exports := [
     { name := "gcd_u64", funcIdx := 0 }
+  ],
+  memory := some { pagesMin := (16 : UInt32), pagesMax := none, data := [] },
+  globals := [
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) }
   ]
 }
 

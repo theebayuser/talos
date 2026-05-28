@@ -77,12 +77,12 @@ def func5 : Wasm.Program :=
 def «module» : Wasm.Module :=
 {
   funcs := [
-    { params := [.i64], locals := [], body := func0 },
-    { params := [.i64], locals := [], body := func1 },
-    { params := [.i64, .i64], locals := [], body := func2 },
-    { params := [.i64, .i64], locals := [], body := func3 },
-    { params := [.i64], locals := [], body := func4 },
-    { params := [.i64], locals := [], body := func5 }
+    { params := [.i64], locals := [], body := func0, results := some [.i64] },
+    { params := [.i64], locals := [], body := func1, results := some [.i32] },
+    { params := [.i64, .i64], locals := [], body := func2, results := some [.i64] },
+    { params := [.i64, .i64], locals := [], body := func3, results := some [.i64] },
+    { params := [.i64], locals := [], body := func4, results := some [.i64] },
+    { params := [.i64], locals := [], body := func5, results := some [.i64] }
   ],
   exports := [
     { name := "filter_positive", funcIdx := 0 },
@@ -92,6 +92,12 @@ def «module» : Wasm.Module :=
     { name := "unwrap_or_default", funcIdx := 4 },
     { name := "wrap", funcIdx := 5 },
     { name := "unwrap_or", funcIdx := 3 }
+  ],
+  memory := some { pagesMin := (16 : UInt32), pagesMax := none, data := [] },
+  globals := [
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) },
+    { type := .i32, init := .i32 (1048576 : UInt32) }
   ]
 }
 

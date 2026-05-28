@@ -6,12 +6,20 @@ import CodeLib
 
 set_option maxRecDepth 1048576
 
-namespace Programs.Simple.IsEven
+namespace Project.IsOdd
 
 open Wasm
 
-/-- export: is_even -/
+/-- export: is_odd -/
 def func0 : Wasm.Program :=
+  [
+  .localGet 0,
+  .const (1 : UInt32),
+  .and
+]
+
+/-- export: is_even -/
+def func1 : Wasm.Program :=
   [
   .localGet 0,
   .const (1 : UInt32),
@@ -22,10 +30,12 @@ def func0 : Wasm.Program :=
 def «module» : Wasm.Module :=
 {
   funcs := [
-    { params := [.i32], locals := [], body := func0, results := some [.i32] }
+    { params := [.i32], locals := [], body := func0, results := some [.i32] },
+    { params := [.i32], locals := [], body := func1, results := some [.i32] }
   ],
   exports := [
-    { name := "is_even", funcIdx := 0 }
+    { name := "is_odd", funcIdx := 0 },
+    { name := "is_even", funcIdx := 1 }
   ],
   memory := some { pagesMin := (16 : UInt32), pagesMax := none, data := [] },
   globals := [
@@ -35,4 +45,4 @@ def «module» : Wasm.Module :=
   ]
 }
 
-end Programs.Simple.IsEven
+end Project.IsOdd
