@@ -1,0 +1,14 @@
+{
+  "name": "talos-report",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Static-site generator that turns `verifier extract` JSON artifacts into a browsable progress report.",
+  "scripts": {
+    "build-report": "tsc -p . && node dist/build.js",
+    "clean": "rm -rf dist out"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
