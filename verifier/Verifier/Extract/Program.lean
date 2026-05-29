@@ -1,4 +1,4 @@
-import Verifier.Extract2.Schema
+import Verifier.Extract.Schema
 
 /-!
 # `Program.lean` module decl locator
@@ -8,7 +8,7 @@ and return a `Program` record. The file is machine-emitted with a
 known shape (see `Verifier/Emit.lean`), so a small line scan suffices.
 -/
 
-namespace Verifier.Extract2.Program
+namespace Verifier.Extract.Program
 
 open System (FilePath)
 
@@ -61,4 +61,4 @@ def find (relPath : String) (body : String) : Option Program := Id.run do
     let modName := if ns.isEmpty then "module" else s!"{ns}.module"
     some { module := modName, location := { file := relPath, span := span }, body := bodySlice }
 
-end Verifier.Extract2.Program
+end Verifier.Extract.Program

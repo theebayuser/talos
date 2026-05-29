@@ -1,6 +1,6 @@
-import Verifier.Extract2.Schema
-import Verifier.Extract2.Git
-import Verifier.Extract2.Source
-import Verifier.Extract2.Rust
-import Verifier.Extract2.Program
-import Verifier.Extract2.Run
+import Verifier.Extract.Schema
+import Verifier.Extract.Git
+import Verifier.Extract.Source
+import Verifier.Extract.Rust
+import Verifier.Extract.Program
+import Verifier.Extract.Run

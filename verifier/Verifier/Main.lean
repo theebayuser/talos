@@ -1,6 +1,6 @@
 import Verifier.Emit
 import Verifier.Path
-import Verifier.Extract2
+import Verifier.Extract
 import Interpreter.Wasm.Decoder.Wat
 import Cli
 
@@ -381,7 +381,7 @@ def runExtract (p : Parsed) : IO UInt32 := do
   else
     "extracted"
   let outDir ← absNormalize ⟨outFlag⟩
-  Verifier.Extract2.run projectDir outDir
+  Verifier.Extract.run projectDir outDir
   pure 0
 
 def newCmd : Cmd := `[Cli|

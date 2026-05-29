@@ -90,9 +90,13 @@ ignored.
 
 A `def Name : Prop := …` (optionally parameterized:
 `def Name (x : T) (y : U) : Prop := …`) becomes a `FormalSpec` iff it
-carries at least one `@[spec_of kind "qualified::name"]` attribute.
+carries at least one `@[spec_of "kind" "qualified::name"]` attribute.
 Defs without `@[spec_of]` are ignored — they are not specs, even when
 their type is `Prop`.
+
+Both the kind and the target are written as string literals; the
+hyphenated kind names (`"rust-exported"`, `"rust-internal"`) are not
+valid Lean identifiers, so quoting is required.
 
 Kinds:
 
@@ -104,10 +108,19 @@ Kinds:
 - `"rust-internal"` — any other Rust path. Opaque to the extractor.
 - `"lean"` — any Lean symbol. Opaque to the extractor.
 
-Multiple `@[spec_of]` attributes on one def are allowed and yield
-multiple `Reference` entries. A malformed attribute, or a
-same-crate `rust-exported` target that doesn't resolve, emits a
-diagnostic; the spec is still recorded.
+Multiple `@[spec_of …]` attributes on one def are allowed and yield
+multiple `Reference` entries. Stack them via the comma-separated form
+inside a single `@[…]` block (Lean does not permit two adjacent
+attribute blocks on one declaration):
+
+```lean
+@[spec_of "rust-exported" "is_odd::is_odd",
+  spec_of "rust-internal" "is_even::is_even"]
+def IsOddSpec : Prop := …
+```
+
+A malformed attribute, or a same-crate `rust-exported` target that
+doesn't resolve, emits a diagnostic; the spec is still recorded.
 
 ### P5. The `@[proves SpecName]` attribute marks verifications
 
@@ -141,16 +154,10 @@ A `FormalSpec` with zero matching verifications is reported as
 
 ### P7. Attribute definitions
 
-The `@[spec_of]` and `@[proves]` attributes must be defined somewhere
-in the dependency chain (`interpreter` or `codelib`). They are project
-conventions the extractor relies on; their actual definitions are out
-of scope for this document.
-
-**Status at time of writing:** P4, P5, and the `@[spec_of]`/`@[proves]`
-attribute definitions in P7 are **not yet in place** in the codebase.
-Until they land, `verifier extract` produces empty `specs` and
-`verifications` lists with diagnostics flagging the gap. P1, P2, P3,
-P6 reflect existing or already-recommended state.
+The `@[spec_of]` and `@[proves]` attributes are defined in
+`codelib/CodeLib/Attrs.lean`. Both are runtime no-ops; the source of
+truth for their semantics is this document and the extractor that
+reads them.
 
 ---
 
@@ -363,7 +370,6 @@ Diagnostic:
 | `missing_rust_crate_for_lean_dir` | warn     | A `lean/Project/<Crate>/` directory has no matching workspace member.       |
 | `export_outside_exports_rs`       | warn     | A `#[unsafe(no_mangle)] pub extern "C"` fn was found outside `exports.rs`.  |
 | `missing_docstring`               | info     | A `FormalSpec` has no `/-- … -/` block.                                     |
-| `prereq_attributes_missing`       | info     | `@[spec_of]` / `@[proves]` infrastructure not yet in codelib (temporary).   |
 | `missing_informal_spec`           | info     | A `FormalSpec` docstring has no `Informal spec:` block.                     |
 | `unproven_spec`                   | info     | A `FormalSpec` has zero matching `@[proves]` verifications.                 |
 | `unresolved_spec_of_target`       | warn     | A same-crate `rust-exported` target doesn't resolve to any export.          |

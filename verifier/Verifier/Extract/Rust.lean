@@ -1,4 +1,4 @@
-import Verifier.Extract2.Schema
+import Verifier.Extract.Schema
 
 /-!
 # Rust `exports.rs` scanner
@@ -22,7 +22,7 @@ nested generics that span weird brace nesting, items with attributes
 spread across complex token trees. The convention forbids these.
 -/
 
-namespace Verifier.Extract2.Rust
+namespace Verifier.Extract.Rust
 
 open System (FilePath)
 
@@ -145,4 +145,4 @@ def scan (relPath : String) (body : String) (crate : String) : List ExportedFunc
       i := i + 1
   return out.toList
 
-end Verifier.Extract2.Rust
+end Verifier.Extract.Rust

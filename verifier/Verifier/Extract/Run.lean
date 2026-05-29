@@ -1,8 +1,9 @@
-import Verifier.Extract2.Schema
-import Verifier.Extract2.Git
-import Verifier.Extract2.Source
-import Verifier.Extract2.Rust
-import Verifier.Extract2.Program
+import Verifier.Extract.Schema
+import Verifier.Extract.Git
+import Verifier.Extract.Source
+import Verifier.Extract.Rust
+import Verifier.Extract.Program
+import Verifier.Extract.Lean
 
 /-!
 # `verifier extract` orchestrator
@@ -10,12 +11,13 @@ import Verifier.Extract2.Program
 Discovers crates (filesystem-based, matching `verifier check`), builds
 one `Artifact` per crate, writes it pretty-printed to `<DIR>/<crate>.json`.
 
-`specs` and `verifications` are emitted as `[]` for now — the
-`@[spec_of]` / `@[proves]` attributes (P4, P5, P7 in EXTRACT.md) don't
-exist yet. A diagnostic flags the prerequisite gap.
+Specs and verifications are populated by `Extract.Lean.scanCrate`
+scanning every `.lean` file under the crate's `lean/Project/<Crate>/`
+directory for the `@[spec_of …]` / `@[proves …]` attributes that
+`codelib/CodeLib/Attrs.lean` registers.
 -/
 
-namespace Verifier.Extract2
+namespace Verifier.Extract
 
 open System (FilePath)
 open Lean (Json)
@@ -114,14 +116,10 @@ private def buildArtifact
   let program := match findProgramLean sources with
     | some (path, body) => Program.find path body
     | none              => none
-  -- P4/P5/P7 prerequisite gap diagnostic — emitted once per crate while
-  -- the attribute infrastructure does not yet exist in codelib.
-  diags := diags.push {
-    severity := .info,
-    kind     := "prereq_attributes_missing",
-    location := { file := info.leanRel, span := { start := ⟨1,1⟩, «end» := ⟨1,1⟩ } },
-    message  := "specs/verifications discovery requires `@[spec_of]` and `@[proves]` (see EXTRACT.md §P4/P5/P7); none recorded"
-  }
+  -- Specs + verifications (P4/P5)
+  let exportNames := exported.map (·.name)
+  let leanFindings := LeanScan.scanCrate sources info.leanRel info.name exportNames
+  diags := diags ++ leanFindings.diagnostics
   -- rustc edition
   let rustc ← readRustcEdition info.rustDir
   pure {
@@ -134,8 +132,8 @@ private def buildArtifact
     code             := sources,
     exported         := exported,
     program          := program,
-    specs            := [],
-    verifications    := [],
+    specs            := leanFindings.specs.toList,
+    verifications    := leanFindings.verifications.toList,
     diagnostics      := diags.toList
   }
 
@@ -156,4 +154,4 @@ def run (projectDir : FilePath) (outDir : FilePath) : IO Unit := do
     IO.FS.writeFile path (Json.pretty json)
     IO.println s!"    wrote {path}"
 
-end Verifier.Extract2
+end Verifier.Extract

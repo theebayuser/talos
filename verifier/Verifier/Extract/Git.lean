@@ -7,7 +7,7 @@ question (e.g. the file isn't tracked, the repo is missing), they
 return an empty string rather than failing extraction.
 -/
 
-namespace Verifier.Extract2.Git
+namespace Verifier.Extract.Git
 
 open System (FilePath)
 
@@ -68,4 +68,4 @@ def sha256File (path : FilePath) : IO String := do
   let line := out.stdout.trimAsciiEnd.toString
   return (line.splitOn " ").headD ""
 
-end Verifier.Extract2.Git
+end Verifier.Extract.Git

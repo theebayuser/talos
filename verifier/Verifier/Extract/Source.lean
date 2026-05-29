@@ -1,5 +1,5 @@
-import Verifier.Extract2.Schema
-import Verifier.Extract2.Git
+import Verifier.Extract.Schema
+import Verifier.Extract.Git
 
 /-!
 # `SourceFile` gathering
@@ -8,7 +8,7 @@ Enumerate tracked files under a directory via `git ls-files`, apply the
 exclusion list from EXTRACT.md, and produce `SourceFile` records.
 -/
 
-namespace Verifier.Extract2.Source
+namespace Verifier.Extract.Source
 
 open System (FilePath)
 
@@ -69,4 +69,4 @@ def gather (repoRoot : FilePath) (rustRel leanRel : String) : IO (List SourceFil
     acc := acc.push (← mkSourceFile repoRoot p)
   return acc.toList
 
-end Verifier.Extract2.Source
+end Verifier.Extract.Source

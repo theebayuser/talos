@@ -9,7 +9,7 @@ camelCase in Lean; the JSON keys are the snake_case names from
 keeps the JSON output stable and easy to scan.
 -/
 
-namespace Verifier.Extract2
+namespace Verifier.Extract
 
 open Lean (Json)
 
@@ -246,4 +246,4 @@ def schemaVersion : Nat := 1
 /-- Current extractor binary semver. -/
 def extractorVersion : String := "0.1.0"
 
-end Verifier.Extract2
+end Verifier.Extract

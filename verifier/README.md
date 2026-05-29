@@ -190,7 +190,7 @@ open Wasm
 Informal spec:
 For any input `n : UInt32`, `is_even` returns `1` when `n` is even
 and `0` otherwise. -/
-@[spec_of rust-exported "is_even::is_even"]
+@[spec_of "rust-exported" "is_even::is_even"]
 def IsEvenSpec : Prop :=
   ∀ (initial : Store) (n : UInt32),
     TerminatesWith «module» 0 initial [.i32 n]
