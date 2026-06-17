@@ -1,4 +1,5 @@
 import Interpreter.Wasm.Mem
+import Interpreter.Wasm.Simd
 
 namespace Wasm
 
@@ -17,6 +18,9 @@ inductive ValueType where
   | f32
   | f64
   | funcref
+  | externref
+  | v128
+  | exnref
 deriving Repr, Inhabited, DecidableEq, BEq
 
 inductive Value where
@@ -29,21 +33,89 @@ inductive Value where
   /-- A `funcref`: `none` is the null ref; `some i` is a reference to
   function index `i` in the enclosing module's function space. -/
   | funcref (idx : Option Nat)
+  /-- An `externref`: `none` is the null ref; `some n` is an opaque
+  host reference distinguished only by its identity `n`. The wasm core
+  never inspects the payload — it only moves externrefs around (locals,
+  globals, tables, `select`) and tests them for null. -/
+  | externref (idx : Option Nat)
+  /-- A `v128` SIMD vector, stored as its 128-bit pattern (lane 0 at the
+  least-significant end, matching wasm's little-endian lane order). -/
+  | v128 (bits : BitVec 128)
+  /-- An `exnref`: `none` is the null ref; `some i` indexes the exception
+  package list on the `Store` (`Store.exns`), which `catch_ref` appends
+  to and `throw_ref` re-raises from. -/
+  | exnref (idx : Option Nat)
 deriving Repr, Inhabited, DecidableEq, BEq
 
 /-- Type-indexed zero used to initialise locals at function entry. The
-zero for a float is `+0.0` (all-zero bits); for `funcref` the null reference. -/
+zero for a float is `+0.0` (all-zero bits); for a reference type the
+null reference of that type. -/
 def ValueType.zero : ValueType → Value
-  | .i32     => .i32 0
-  | .i64     => .i64 0
-  | .f32     => .f32 0
-  | .f64     => .f64 0
-  | .funcref => .funcref none
+  | .i32       => .i32 0
+  | .i64       => .i64 0
+  | .f32       => .f32 0
+  | .f64       => .f64 0
+  | .funcref   => .funcref none
+  | .externref => .externref none
+  | .v128      => .v128 0
+  | .exnref    => .exnref none
+
+/-- The scalar payload of a value, as the unsigned `Nat` of its bit
+pattern, when the value is the scalar kind lane shape `sh` expects
+(`i32` for i8x16/i16x8/i32x4, `i64` for i64x2, `f32`/`f64` for the float
+shapes). Used by `vSplat`/`vReplaceLane`, which consume one scalar. -/
+def Value.scalarBitsFor? : Simd.Shape → Value → Option Nat
+  | .i8x16, .i32 x => some x.toNat
+  | .i16x8, .i32 x => some x.toNat
+  | .i32x4, .i32 x => some x.toNat
+  | .i64x2, .i64 x => some x.toNat
+  | .f32x4, .f32 x => some x.toNat
+  | .f64x2, .f64 x => some x.toNat
+  | _,      _      => none
+
+/-- The address payload of an `i32` or `i64` operand as a `Nat`. Wasm's
+64-bit address types (memory64) make the operand width per-memory; bulk
+ops with several address operands accept each one by its runtime type. -/
+def Value.addrNat? : Value → Option Nat
+  | .i32 a => some a.toNat
+  | .i64 a => some a.toNat
+  | _      => none
+
+/-- Null test for reference values: `some true/false` for refs, `none`
+for non-reference values (ill-typed input). -/
+def Value.isNullRef? : Value → Option Bool
+  | .funcref r   => some r.isNone
+  | .externref r => some r.isNone
+  | .exnref r    => some r.isNone
+  | _            => none
+
+/-- A size/length result, typed by the owning memory/table's address
+type: `i64` for 64-bit memories/tables (memory64 proposal), `i32`
+otherwise. Used by `memory.size`, `table.size`, and the grow results. -/
+def sizeValue (is64 : Bool) (n : Nat) : Value :=
+  if is64 then .i64 (UInt64.ofNat n) else .i32 (UInt32.ofNat n)
+
+@[simp] theorem sizeValue_false (n : Nat) :
+    sizeValue false n = .i32 (UInt32.ofNat n) := rfl
+
+@[simp] theorem sizeValue_true (n : Nat) :
+    sizeValue true n = .i64 (UInt64.ofNat n) := rfl
 
 /-- Module-level globals. Indexed by position in the module's globals list. -/
 structure Globals where
   globals : List Value := []
 deriving Repr, Inhabited
+
+/-- One catch clause of a `try_table`. The label is a branch depth
+resolved from just inside the construct (0 = the `try_table` itself).
+`catch`/`catchRef` match one tag; the `All` forms match any. The `Ref`
+forms additionally push the caught exception package as an `exnref`. -/
+inductive CatchClause where
+  | catch (tag label : Nat)
+  | catchRef (tag label : Nat)
+  | catchAll (label : Nat)
+  | catchAllRef (label : Nat)
+deriving Repr, Inhabited, DecidableEq
 
 /-! ## Instructions
 
@@ -152,6 +224,39 @@ inductive Instruction where
   | ret     : Instruction
   | call    : Nat → Instruction
 
+  -- Tail calls. `return_call f` replaces the current frame with an
+  -- invocation of `f`: the callee's results become the current
+  -- function's results (validation requires the result types to agree).
+  -- The fuel-bounded interpreter resolves these in `run`, so deep chains
+  -- of tail calls consume fuel but not host stack.
+  | returnCall : Nat → Instruction
+  | returnCallIndirect : (typeIdx tableIdx : Nat) → Instruction
+
+  -- Exception handling (wasm 3.0). `throw t` pops tag `t`'s parameters
+  -- and raises an exception that unwinds until a `tryTable` with a
+  -- matching clause catches it; `throwRef` re-raises a caught exception
+  -- package (trapping on the null exnref). `tryTable` executes its body
+  -- like a `block`; clause labels are resolved as branches from just
+  -- inside the construct (label 0 exits the `tryTable` itself).
+  | throwI : (tagIdx : Nat) → Instruction
+  | throwRef : Instruction
+  | tryTable : (paramArity resultArity : Nat) → List CatchClause →
+               List Instruction → Instruction
+
+  -- Typed function references (wasm 3.0). `call_ref (type N)` pops a
+  -- funcref and dispatches to it, trapping on null; the static type
+  -- annotation needs no runtime check (validation guarantees it), so the
+  -- immediate is kept only for round-tripping. `return_call_ref` is its
+  -- tail-call form. `ref.as_non_null` asserts non-null (trapping
+  -- otherwise); `br_on_null l` branches to `l` when the popped ref is
+  -- null (consuming it) and pushes it back otherwise; `br_on_non_null l`
+  -- branches with the ref kept when non-null and consumes it otherwise.
+  | callRef : (typeIdx : Nat) → Instruction
+  | returnCallRef : (typeIdx : Nat) → Instruction
+  | refAsNonNull : Instruction
+  | brOnNull : Nat → Instruction
+  | brOnNonNull : Nat → Instruction
+
   -- Indirect call. `typeIdx` selects the expected signature from the
   -- enclosing module's type table; `tableIdx` selects the table (almost
   -- always 0 in practice). The runtime pops an `i32` index `i`, looks up
@@ -166,18 +271,50 @@ inductive Instruction where
   -- function index `i`). These produce and test such values; none of them
   -- touch the store.
   | refNull   : Instruction        -- ref.null func: push the null funcref
+  | refNullExtern : Instruction    -- ref.null extern: push the null externref
   | refFunc   : Nat → Instruction  -- ref.func i:    push a reference to function `i`
   | refIsNull : Instruction        -- ref.is_null:   pop a ref, push i32 1 if null else 0
 
   -- Table instructions. The runtime tables live on the `Store` (one
-  -- `TableInst = List (Option Nat)` per declared table). These read them
-  -- without mutating: `table.get t` pops an i32 index `i` and pushes
-  -- `tables[t][i]` as a `funcref` (trapping if `i` is past the table's
-  -- current length); `table.size t` pushes the table's current length as
-  -- an i32. A `tableIdx` that is itself out of range is a validation
-  -- error, not a runtime trap.
+  -- `TableInst = List Value`, holding reference values, per declared
+  -- table). `table.get t` pops an i32 index `i` and pushes `tables[t][i]`
+  -- (trapping if `i` is past the table's current length); `table.size t`
+  -- pushes the table's current length as an i32. A `tableIdx` that is
+  -- itself out of range is a validation error, not a runtime trap.
   | tableGet  : Nat → Instruction  -- table.get t
   | tableSize : Nat → Instruction  -- table.size t
+
+  -- table.set t: pops [val(ref), idx(i32)] (top = val) and writes
+  -- `tables[t][idx] := val`, trapping "out of bounds table access" if
+  -- `idx` is past the table's current length.
+  | tableSet  : Nat → Instruction
+
+  -- table.grow t: pops [delta(i32), init(ref)] (top = delta). On success
+  -- the table is extended by `delta` copies of `init` and the *old* size
+  -- is pushed; on failure (past the declared max, or past the
+  -- implementation's growth ceiling — the spec permits growth to fail)
+  -- pushes -1.
+  | tableGrow : Nat → Instruction
+
+  -- table.fill t: pops [len(i32), val(ref), dst(i32)] (top = len) and
+  -- writes `val` into `tables[t][dst, dst+len)`. Traps "out of bounds
+  -- table access" before any write if `dst+len` exceeds the table size.
+  | tableFill : Nat → Instruction
+
+  -- table.copy d s: pops [len(i32), src(i32), dst(i32)] (top = len) and
+  -- copies `tables[s][src, src+len)` to `tables[d][dst, dst+len)` with
+  -- memmove semantics. Traps before any write if either range escapes
+  -- its table.
+  | tableCopy : (dstIdx srcIdx : Nat) → Instruction
+
+  -- table.init t e: pops [len(i32), src(i32), dst(i32)] (top = len) and
+  -- copies entries `[src, src+len)` of element segment `e` into
+  -- `tables[t][dst, dst+len)`. A dropped segment behaves as length 0.
+  -- Traps before any write on either bounds violation.
+  | tableInit : (tableIdx elemIdx : Nat) → Instruction
+
+  -- elem.drop e: mark element segment `e` as dropped. Idempotent.
+  | elemDrop : Nat → Instruction
 
   -- i32 memory loads (static byte offset; address popped from stack as i32)
   | load8U  : UInt32 → Instruction  -- i32.load8_u:  zero-extend 1 byte  → i32
@@ -233,6 +370,51 @@ inductive Instruction where
   -- can read from it). Idempotent.
   | dataDrop : Nat → Instruction
 
+  -- Multi-memory. `memOp k op` runs the memory instruction `op` against
+  -- memory index `k ≥ 1` (`Store.extraMems[k-1]`): the interpreter swaps
+  -- that memory (and its declaration) into the default slot, runs `op`,
+  -- and swaps the result back. The decoder only wraps memory
+  -- instructions, and only when the index is non-zero.
+  | memOp : (memIdx : Nat) → Instruction → Instruction
+
+  -- memory.copy d s with distinct memories (multi-memory): pops
+  -- [len, src, dst] (top = len; each i32 or i64 per its memory's address
+  -- type) and copies from memory `s` to memory `d`, with both bounds
+  -- checked before any write.
+  | memoryCopyBetween : (dstMem srcMem : Nat) → Instruction
+
+  -- SIMD (v128). Lane-level semantics live in `Interpreter.Wasm.Simd`;
+  -- the constructors here group the proposal's ~240 mnemonics by
+  -- operand/result shape. Memory variants mirror the scalar load/store
+  -- constructors (static byte offset; i32 address popped from the stack).
+  | vConst   : BitVec 128 → Instruction       -- v128.const
+  | vUnOp    : Simd.UnOp → Instruction        -- v128 → v128
+  | vBinOp   : Simd.BinOp → Instruction       -- v128 v128 → v128
+  | vBitselect : Instruction                  -- v128 v128 v128 → v128
+  | vTestOp  : Simd.TestOp → Instruction      -- v128 → i32
+  | vShiftOp : Simd.ShiftOp → Instruction     -- v128 i32 → v128
+  | vSplat   : Simd.Shape → Instruction       -- scalar → v128
+  -- extract_lane: `signed` only meaningful for the i8x16/i16x8 `_s` forms
+  | vExtractLane : Simd.Shape → (signed : Bool) → (lane : Nat) → Instruction
+  | vReplaceLane : Simd.Shape → (lane : Nat) → Instruction
+  | vShuffle : List Nat → Instruction         -- i8x16.shuffle (16 lane indices)
+  -- Relaxed SIMD, deterministic choices (see Interpreter.Wasm.Simd):
+  -- relaxed_madd/nmadd (unfused multiply-add) and the dot-add form.
+  | vFma : Simd.Shape → (neg : Bool) → Instruction  -- v128³ → v128
+  | vDotAdd : Instruction                           -- v128³ → v128
+  | v128Load  : UInt32 → Instruction          -- v128.load: 16-byte load
+  | v128Store : UInt32 → Instruction          -- v128.store: 16-byte store
+  -- v128.load8x8_s/u, 16x4, 32x2: load 8 bytes, widen each half-lane
+  | v128LoadExt : (srcBits : Nat) → (signed : Bool) → UInt32 → Instruction
+  -- v128.load8/16/32/64_splat: load one lane, broadcast
+  | v128LoadSplat : (bits : Nat) → UInt32 → Instruction
+  -- v128.load32/64_zero: load one lane, zero the rest
+  | v128LoadZero : (bits : Nat) → UInt32 → Instruction
+  -- v128.load8/16/32/64_lane: load one lane into an existing vector
+  | v128LoadLane  : (bits lane : Nat) → UInt32 → Instruction
+  -- v128.store8/16/32/64_lane: store one lane of a vector
+  | v128StoreLane : (bits lane : Nat) → UInt32 → Instruction
+
   -- Parametric / nullary
   | drop
   | select
@@ -274,6 +456,9 @@ a *passive* segment carries `offset := none` and stays available to
 structure DataSegment where
   offset : Option UInt32
   bytes  : List UInt8
+  /-- Target memory index (multi-memory): 0 is the default memory, k ≥ 1
+  the k-th extra memory (`Module.extraMemories[k-1]`). -/
+  memIdx : Nat := 0
 deriving Repr, Inhabited
 
 /-- Declaration of a single linear memory. Wasm allows at most one
@@ -282,6 +467,10 @@ structure MemDecl where
   pagesMin : UInt32
   pagesMax : Option UInt32 := none
   data     : List DataSegment := []
+  /-- `true` for a 64-bit memory (the wasm 3.0 memory64 address type):
+  addresses are popped as `i64`, and `memory.size` / `memory.grow` speak
+  `i64` instead of `i32`. -/
+  is64     : Bool := false
 deriving Repr, Inhabited
 
 /-- Declaration of a module-level global with its initial value. -/
@@ -305,6 +494,10 @@ structure TableDecl where
   min      : Nat
   max      : Option Nat := none
   elemType : ValueType  := .funcref
+  /-- `true` for a 64-bit table (the wasm 3.0 table64 address type):
+  element indices are popped as `i64`, and `table.size` / `table.grow`
+  speak `i64` instead of `i32`. -/
+  is64     : Bool := false
 deriving Repr, Inhabited
 
 /-- Declaration of a function imported from the host. Imports occupy the
@@ -336,6 +529,11 @@ structure Module where
   funcs    : List Function
   exports  : List Export := []
   memory   : Option MemDecl := none
+  /-- Additional memories (multi-memory proposal), in declaration order:
+  memory index `k ≥ 1` is `extraMemories[k-1]`. Their active data
+  segments live in `memory`'s (global, source-ordered) `data` list,
+  routed by `DataSegment.memIdx`. -/
+  extraMemories : List MemDecl := []
   globals  : List GlobalDecl := []
   /-- Imported functions, in declaration order. See `ImportDecl` for the
   index-space convention. Empty for modules with no imports. -/
@@ -353,12 +551,31 @@ structure Module where
   whole list anyway. -/
   tables   : List TableDecl := []
   elements : List ElementSegment := []
+  /-- Names of imported non-function entities, aligned with the *first*
+  k entries of the corresponding index space: per the wasm spec,
+  imported globals/tables/memories occupy the low indices in import
+  order, ahead of the module's own declarations. The decoder fills the
+  corresponding decl slots with the import's declared shape (zero
+  contents); the test harness substitutes registered/spectest values at
+  instantiation. -/
+  importedGlobals  : List (String × String) := []
+  importedTables   : List (String × String) := []
+  importedMemories : List (String × String) := []
+  /-- Exported non-function entities: name → index into the
+  corresponding index space. Used by the harness to resolve
+  cross-module entity imports. -/
+  globalExports : List (String × Nat) := []
+  tableExports  : List (String × Nat) := []
+  memoryExports : List (String × Nat) := []
+  /-- Exception tags (exception-handling proposal), indexed by position;
+  each carries the tag's parameter types (`results` is always empty). -/
+  tags : List FuncType := []
 deriving Repr, Inhabited
 
-/-- Runtime representation of a single table: a list of `funcref` slots
-(`none` = null, `some i` = function index `i`). The length is the
-table's current size; we don't model `table.grow`. -/
-abbrev TableInst : Type := List (Option Nat)
+/-- Runtime representation of a single table: a list of reference
+values (`.funcref` or `.externref`, matching the table's declared
+element type). The length is the table's current size. -/
+abbrev TableInst : Type := List Value
 
 /-- The mutable runtime state threaded through execution: module-level
 globals, the (optional) linear memory, available bytes per data segment
@@ -373,6 +590,9 @@ logger, etc. No schema is baked into the Wasm core. -/
 structure Store (α : Type) where
   globals         : Globals
   mem             : Mem
+  /-- Runtime instances of the module's `extraMemories` (multi-memory):
+  memory index `k ≥ 1` is `extraMems[k-1]`. -/
+  extraMems       : List Mem := []
   dataSegments    : List (Option (List UInt8)) := []
   /-- Runtime tables. Same length and source order as the declaring
   module's `tables`; entry `t` has size at least `tables[t].min`. -/
@@ -382,12 +602,16 @@ structure Store (α : Type) where
   passive segment still available to `table.init`. Same length as the
   declaring module's `elements` list. -/
   elementSegments : List (Option (List (Option Nat))) := []
+  /-- Caught exception packages (tag index × thrown args in stack order),
+  appended by `catch_ref` clauses and re-raised by `throw_ref`. Indexed
+  by `Value.exnref`. -/
+  exns            : List (Nat × List Value) := []
   host            : α
 deriving Repr
 
 /-- Replace `list[i]` in place. Returns the original list unchanged
 if `i ≥ list.length`. -/
-private def listSetAt (l : List α) (i : Nat) (v : α) : List α :=
+def listSetAt (l : List α) (i : Nat) (v : α) : List α :=
   match l, i with
   | [],     _     => []
   | _::xs, 0      => v :: xs
@@ -398,7 +622,7 @@ fall past the end. Used to apply an active element segment to a fresh
 table; bounds violations are detected by the caller before this is
 invoked, so silent truncation here is unreachable in well-formed
 input. -/
-private def listWriteAt (l : List α) (off : Nat) (vs : List α) : List α :=
+def listWriteAt (l : List α) (off : Nat) (vs : List α) : List α :=
   match vs, off with
   | [], _ => l
   | v :: vs', 0     => match l with
@@ -420,24 +644,36 @@ passive/declarative segments are stashed in `elementSegments` for
 0-page memory. -/
 def Module.initialStore [Inhabited α] (m : Module) : Store α :=
   let globals : Globals := { globals := m.globals.map (·.init) }
+  -- Apply the active data segments targeting memory `idx` to `m0`.
+  -- Segments live in one global, source-ordered list (memory 0's
+  -- `data`); `DataSegment.memIdx` routes each to its memory.
+  let applySegs (segs : List DataSegment) (idx : Nat) (m0 : Mem) : Mem :=
+    segs.foldl
+      (fun acc seg => match seg.offset with
+        | some off =>
+          if seg.memIdx = idx then acc.writeBytes off.toNat seg.bytes else acc
+        | none     => acc)
+      m0
+  let allSegs : List DataSegment := match m.memory with
+    | some decl => decl.data
+    | none      => []
   let (mem, dataSegments) : Mem × List (Option (List UInt8)) :=
     match m.memory with
     | none      => (Mem.empty 0, [])
     | some decl =>
-      let m0 := Mem.empty decl.pagesMin.toNat
-      let mem : Mem := decl.data.foldl
-        (fun acc seg => match seg.offset with
-          | some off => acc.writeBytes off.toNat seg.bytes
-          | none     => acc)
-        m0
+      let mem : Mem := applySegs decl.data 0 (Mem.empty decl.pagesMin.toNat)
       let dataSegments : List (Option (List UInt8)) :=
         decl.data.map fun seg => match seg.offset with
           | some _ => none           -- active: auto-dropped after init
           | none   => some seg.bytes -- passive: available to memory.init
       (mem, dataSegments)
-  -- Allocate tables filled with null refs at the declared minimum size.
+  -- Extra memories (multi-memory): memory k = extraMems[k-1].
+  let extraMems : List Mem := m.extraMemories.zipIdx.map fun (decl, i) =>
+    applySegs allSegs (i + 1) (Mem.empty decl.pagesMin.toNat)
+  -- Allocate tables filled with the element type's null ref at the
+  -- declared minimum size.
   let baseTables : List TableInst :=
-    m.tables.map fun td => (List.replicate td.min none : TableInst)
+    m.tables.map fun td => (List.replicate td.min td.elemType.zero : TableInst)
   -- Apply active element segments. Passive/declarative segments leave the
   -- table untouched and are tracked in `elementSegments` so `table.init`
   -- can consume them later.
@@ -446,7 +682,7 @@ def Module.initialStore [Inhabited α] (m : Module) : Store α :=
       match seg.tableIdx, seg.offset with
       | some t, some off =>
         match acc[t]? with
-        | some tbl => listSetAt acc t (listWriteAt tbl off seg.funcs)
+        | some tbl => listSetAt acc t (listWriteAt tbl off (seg.funcs.map Value.funcref))
         | none     => acc
       | _, _ => acc)
     baseTables
@@ -454,7 +690,7 @@ def Module.initialStore [Inhabited α] (m : Module) : Store α :=
     m.elements.map fun seg => match seg.offset with
       | some _ => none           -- active: auto-dropped
       | none   => some seg.funcs -- passive / declarative
-  { globals, mem, dataSegments, tables, elementSegments, host := default }
+  { globals, mem, extraMems, dataSegments, tables, elementSegments, host := default }
 
 /-- Maximum number of pages an i32-indexed memory can hold (2^16, or 4 GiB).
 This is the wasm spec hard ceiling; `memory.grow` may not exceed it
@@ -464,7 +700,12 @@ def Module.memoryHardCap : Nat := 65536
 /-- Effective `memory.grow` ceiling for `m`: the declared `pagesMax`
 (if any) intersected with `memoryHardCap`. Modules with no memory
 declaration get the hard cap; this is never observed in practice
-because such modules have no memory instructions. -/
+because such modules have no memory instructions.
+
+The 65536-page (4 GiB) ceiling deliberately applies to 64-bit
+(memory64) memories as well: the spec permits `memory.grow` to fail
+for implementation-defined reasons, and this interpreter caps every
+memory at the i32 hard limit. -/
 def Module.memoryCap (m : Module) : Nat :=
   match m.memory with
   | some d =>
@@ -473,8 +714,52 @@ def Module.memoryCap (m : Module) : Nat :=
     | none   => Module.memoryHardCap
   | none => Module.memoryHardCap
 
+/-- Whether the module's memory is 64-bit-addressed (memory64). -/
+def Module.memIs64 (m : Module) : Bool :=
+  match m.memory with
+  | some d => d.is64
+  | none   => false
+
+/-- Whether table `t` is 64-bit-indexed (table64). -/
+def Module.tableIs64 (m : Module) (t : Nat) : Bool :=
+  match m.tables[t]? with
+  | some td => td.is64
+  | none    => false
+
 /-- Look up the index of an exported function by name. -/
 def Module.findExport (m : Module) (name : String) : Option Nat :=
   (m.exports.find? (·.name = name)).map (·.funcIdx)
+
+/-- Signature of a function in the *unified* index space: indices below
+`imports.length` resolve to the import's declared signature, the rest to
+the in-module function's declared signature. Used by `call_indirect` to
+type-check the table entry against the expected `(type N)` — looking the
+target up in `m.funcs` directly would be off by `imports.length` for
+modules with function imports. -/
+def Module.funcSig? (m : Module) (i : Nat) : Option FuncType :=
+  match m.imports[i]? with
+  | some imp => some { params := imp.params, results := imp.results }
+  | none     =>
+    match m.funcs[i - m.imports.length]? with
+    | some f => some { params := f.params, results := f.results }
+    | none   => none
+
+/-- Implementation ceiling on `table.grow`. The wasm spec allows growth
+to fail for implementation-defined reasons; this interpreter materialises
+tables as Lean lists, so unbounded growth (the suite probes deltas up to
+`0xFFFF_FFF0`) must be refused rather than attempted. Growth that stays
+within a table's *declared* max is always honoured — declared maxima in
+practice are small — and growth beyond this ceiling fails with -1. -/
+def Module.tableHardCap : Nat := 1_000_000
+
+/-- Effective `table.grow` ceiling for table `t` of `m`: the declared max
+(if any) intersected with the implementation ceiling `tableHardCap`. -/
+def Module.tableCap (m : Module) (t : Nat) : Nat :=
+  match m.tables[t]? with
+  | some td =>
+    match td.max with
+    | some n => Nat.min n Module.tableHardCap
+    | none   => Module.tableHardCap
+  | none => Module.tableHardCap
 
 end Wasm

@@ -15,6 +15,10 @@ Once a run has succeeded with some amount of fuel (≠ `.OutOfFuel`), adding
 more fuel doesn't change the answer. This is what makes the `∃ N, ∀ fuel ≥ N`
 existential in `wp` well-behaved. -/
 
+-- The single induction over every instruction arm; `execOne`'s match has
+-- grown large enough (SIMD, 64-bit, multi-memory, tail calls) that the
+-- default heartbeat budget no longer covers its equation unfolding.
+set_option maxHeartbeats 1600000 in
 /-- Joint induction principle for fuel monotonicity of `execOne`, `exec`, and
 `run`. Proved by induction on `f₁`; the three public theorems below are
 one-line projections. -/
@@ -79,7 +83,9 @@ theorem fuel_mono_aux : ∀ (f₁ : Nat),
         have hexec : exec k m st s body env ≠ .OutOfFuel := by
           intro h; apply hne; simp only [execOne, h]
         rw [ihExec m env st s body k' hk' hexec]
-        rcases hres : exec k m st s body env with ⟨st', s'⟩ | ⟨n, st', s'⟩ | ⟨st', vs⟩ | msg | msg | _
+        rcases hres : exec k m st s body env with
+          ⟨st', s'⟩ | ⟨n, st', s'⟩ | ⟨st', vs⟩ | msg | msg | _ | ⟨id', st', vs⟩
+            | ⟨tag, targs, st', s'⟩
         · rfl
         · cases n with
           | zero =>
@@ -98,6 +104,8 @@ theorem fuel_mono_aux : ∀ (f₁ : Nat),
         · rfl
         · rfl
         · exact absurd hres hexec
+        · rfl
+        · rfl
       | iff ps rs thn els =>
         simp only [execOne]
         rcases hvals : s.values with _ | ⟨v, vs⟩
@@ -121,6 +129,9 @@ theorem fuel_mono_aux : ∀ (f₁ : Nat),
           | f32 _ => rfl
           | f64 _ => rfl
           | funcref _ => rfl
+          | externref _ => rfl
+          | exnref _ => rfl
+          | v128 _ => rfl
       | call id =>
         simp only [execOne]
         have hrun : run k m id st s.values env ≠ .OutOfFuel := by
@@ -136,32 +147,111 @@ theorem fuel_mono_aux : ∀ (f₁ : Nat),
         rcases hvals : s.values with _ | ⟨v, rest⟩
         · simp only [execOne, hvals]
         · cases hv : v with
-          | i64 _    => simp only [execOne, hvals, hv]
+          | i64 i =>
+            -- table64 selector arm: same case tree as the i32 arm below,
+            -- with an i64 selector.
+            rcases htbl : st.tables[tj]? with _ | tbl
+            · simp only [execOne, hvals, hv, htbl]
+            · rcases hslot : tbl[i.toNat]? with _ | slot
+              · simp only [execOne, hvals, hv, htbl, hslot]
+              · cases hslot' : slot with
+                | i32 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | i64 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | f32 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | f64 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | externref _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | exnref _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | v128 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | funcref r =>
+                  rcases hr : r with _ | fid
+                  · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr]
+                  · rcases hfn : m.funcSig? fid with _ | fn
+                    · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr, hfn]
+                    · rcases hty : m.types[ti]? with _ | ty
+                      · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr, hfn, hty]
+                      · by_cases hsig :
+                            fn.params = ty.params ∧ fn.results = ty.results
+                        · have hrun : run k m fid st rest env ≠ .OutOfFuel := by
+                            intro h; apply hne
+                            simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                              hfn, hty, if_pos hsig, h]
+                          simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                            hfn, hty, if_pos hsig,
+                            ihRun m env fid st rest k' hk' hrun]
+                        · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                            hfn, hty, if_neg hsig]
           | f32 _    => simp only [execOne, hvals, hv]
           | f64 _    => simp only [execOne, hvals, hv]
           | funcref _ => simp only [execOne, hvals, hv]
+          | externref _ => simp only [execOne, hvals, hv]
+          | exnref _ => simp only [execOne, hvals, hv]
+          | v128 _ => simp only [execOne, hvals, hv]
           | i32 i =>
             rcases htbl : st.tables[tj]? with _ | tbl
             · simp only [execOne, hvals, hv, htbl]
             · rcases hslot : tbl[i.toNat]? with _ | slot
               · simp only [execOne, hvals, hv, htbl, hslot]
-              · rcases hslot' : slot with _ | fid
-                · simp only [execOne, hvals, hv, htbl, hslot, hslot']
-                · rcases hfn : m.funcs[fid]? with _ | fn
-                  · simp only [execOne, hvals, hv, htbl, hslot, hslot', hfn]
-                  · rcases hty : m.types[ti]? with _ | ty
-                    · simp only [execOne, hvals, hv, htbl, hslot, hslot', hfn, hty]
-                    · by_cases hsig :
-                          fn.params = ty.params ∧ fn.results = ty.results
-                      · have hrun : run k m fid st rest env ≠ .OutOfFuel := by
-                          intro h; apply hne
-                          simp only [execOne, hvals, hv, htbl, hslot, hslot',
-                            hfn, hty, if_pos hsig, h]
-                        simp only [execOne, hvals, hv, htbl, hslot, hslot',
-                          hfn, hty, if_pos hsig,
-                          ihRun m env fid st rest k' hk' hrun]
-                      · simp only [execOne, hvals, hv, htbl, hslot, hslot',
-                          hfn, hty, if_neg hsig]
+              · cases hslot' : slot with
+                | i32 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | i64 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | f32 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | f64 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | externref _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | exnref _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | v128 _ => simp only [execOne, hvals, hv, htbl, hslot, hslot']
+                | funcref r =>
+                  rcases hr : r with _ | fid
+                  · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr]
+                  · rcases hfn : m.funcSig? fid with _ | fn
+                    · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr, hfn]
+                    · rcases hty : m.types[ti]? with _ | ty
+                      · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr, hfn, hty]
+                      · by_cases hsig :
+                            fn.params = ty.params ∧ fn.results = ty.results
+                        · have hrun : run k m fid st rest env ≠ .OutOfFuel := by
+                            intro h; apply hne
+                            simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                              hfn, hty, if_pos hsig, h]
+                          simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                            hfn, hty, if_pos hsig,
+                            ihRun m env fid st rest k' hk' hrun]
+                        · simp only [execOne, hvals, hv, htbl, hslot, hslot', hr,
+                            hfn, hty, if_neg hsig]
+      | tryTable ps rs catches body =>
+        simp only [execOne]
+        have hexec : exec k m st s body env ≠ .OutOfFuel := by
+          intro h; apply hne; simp only [execOne, h]
+        rw [ihExec m env st s body k' hk' hexec]
+      | callRef ti =>
+        rcases hvals : s.values with _ | ⟨v, rest⟩
+        · simp only [execOne, hvals]
+        · cases hv : v with
+          | i32 _ => simp only [execOne, hvals, hv]
+          | i64 _ => simp only [execOne, hvals, hv]
+          | f32 _ => simp only [execOne, hvals, hv]
+          | f64 _ => simp only [execOne, hvals, hv]
+          | externref _ => simp only [execOne, hvals, hv]
+          | exnref _ => simp only [execOne, hvals, hv]
+          | v128 _ => simp only [execOne, hvals, hv]
+          | funcref r =>
+            rcases hr : r with _ | fid
+            · simp only [execOne, hvals, hv, hr]
+            · have hrun : run k m fid st rest env ≠ .OutOfFuel := by
+                intro h; apply hne; simp only [execOne, hvals, hv, hr, h]
+              simp only [execOne, hvals, hv, hr,
+                ihRun m env fid st rest k' hk' hrun]
+      | memOp kIdx inner =>
+        rcases hmem : st.extraMems[kIdx - 1]? with _ | memK
+        · simp only [execOne, hmem]
+        · rcases hdecl : m.extraMemories[kIdx - 1]? with _ | declK
+          · simp only [execOne, hmem, hdecl]
+          · have hin : execOne k { m with memory := some declK }
+                { st with mem := memK } s inner env ≠ .OutOfFuel := by
+              intro h; apply hne
+              simp only [execOne, hmem, hdecl, h]
+            simp only [execOne, hmem, hdecl,
+              ihOne { m with memory := some declK } env { st with mem := memK }
+                s inner k' hk' hin]
       | _ => simp only [execOne]
     -- Step 2: prove exec at fuel k+1 using monoOne.
     have monoExec :
@@ -198,6 +288,25 @@ theorem fuel_mono_aux : ∀ (f₁ : Nat),
           apply hne
           simp only [run, hImp, h, hOOF]
         rw [monoExec _ _ _ _ _ f₂ hle hexec]
+        -- The ReturnCall arm still references `runTail` at the two fuels;
+        -- fold them with the run-level IH. All other arms are identical.
+        rcases hres : exec (k+1) m initial
+            (f.toLocals (args.take f.numParams).reverse) f.body env with
+          _ | ⟨n, _, _⟩ | _ | _ | _ | _ | ⟨id', st', vs⟩ | _
+        · rfl
+        · cases n <;> rfl
+        · rfl
+        · rfl
+        · rfl
+        · rfl
+        · obtain ⟨f₂', rfl⟩ : ∃ f₂', f₂ = f₂' + 1 := ⟨f₂ - 1, by omega⟩
+          have hk2 : k ≤ f₂' := by omega
+          have hrt : run k m id' st' vs env ≠ .OutOfFuel := by
+            intro hOOF
+            apply hne
+            simp only [run, hImp, h, hres, runTail, hOOF]
+          simp only [runTail, ihRun m env id' st' vs f₂' hk2 hrt]
+        · rfl
     · -- host path: result is fuel-independent.
       rfl
 
@@ -242,9 +351,11 @@ theorem exec_block_cons
            { s' with values := s'.values.take rs ++ s.values.drop ps } rest env
        | other                => other) := by
   simp only [exec, execOne]
-  rcases exec fuel m st s body env with _ | ⟨n, _, _⟩ | _ | _ | _ | _
+  rcases exec fuel m st s body env with _ | ⟨n, _, _⟩ | _ | _ | _ | _ | _ | _
   · rfl
   · cases n <;> rfl
+  · rfl
+  · rfl
   · rfl
   · rfl
   · rfl
@@ -288,9 +399,10 @@ theorem exec_call_cons
        | .Success vs st' => exec (fuel + 1) m st' { s with values := vs } rest env
        | .Trap st' msg   => .Trap st' msg
        | .Invalid msg    => .Invalid msg
-       | .OutOfFuel      => .OutOfFuel) := by
+       | .OutOfFuel      => .OutOfFuel
+       | .Thrown tag targs st' => .Throwing tag targs st' s) := by
   simp only [exec, execOne]
-  rcases run fuel m id st s.values env with _ | _ | _ | _ <;> rfl
+  rcases run fuel m id st s.values env with _ | _ | _ | _ | _ <;> rfl
 
 /-- Specialised characterisation of `exec` on a `.call id :: rest` whose
 target `id` falls inside the imports range. Exposes the host's `invoke`
@@ -323,11 +435,11 @@ theorem exec_callIndirect_cons {α : Type}
     {m : Module} {env : HostEnv α} {st : Store α} {s : Locals}
     {ti tj : Nat} {rest : Program} {fuel : Nat}
     {i : UInt32} {vs0 : List Value}
-    {tbl : TableInst} {fid : Nat} {fn : Function} {ty : FuncType}
+    {tbl : TableInst} {fid : Nat} {fn : FuncType} {ty : FuncType}
     (hStack : s.values = .i32 i :: vs0)
     (hTbl  : st.tables[tj]? = some tbl)
-    (hSlot : tbl[i.toNat]? = some (some fid))
-    (hFn   : m.funcs[fid]? = some fn)
+    (hSlot : tbl[i.toNat]? = some (.funcref (some fid)))
+    (hFn   : m.funcSig? fid = some fn)
     (hTy   : m.types[ti]? = some ty)
     (hSig  : fn.params = ty.params ∧ fn.results = ty.results) :
     exec (fuel + 1) m st s (.callIndirect ti tj :: rest) env =
@@ -335,9 +447,10 @@ theorem exec_callIndirect_cons {α : Type}
        | .Success vs st' => exec (fuel + 1) m st' { s with values := vs } rest env
        | .Trap st' msg   => .Trap st' msg
        | .Invalid msg    => .Invalid msg
-       | .OutOfFuel      => .OutOfFuel) := by
+       | .OutOfFuel      => .OutOfFuel
+       | .Thrown tag targs st' => .Throwing tag targs st' s) := by
   simp only [exec, execOne, hStack, hTbl, hSlot, hFn, hTy, if_pos hSig]
-  rcases run fuel m fid st vs0 env with _ | _ | _ | _ <;> rfl
+  rcases run fuel m fid st vs0 env with _ | _ | _ | _ | _ <;> rfl
 
 /-! ## `run` characterisation -/
 
@@ -368,13 +481,19 @@ theorem run_eq
            .Invalid "Unexpected break targeting scope out of function"
          | .Invalid msg      => .Invalid msg
          | .Trap st msg      => .Trap st msg
-         | .OutOfFuel        => .OutOfFuel) := by
+         | .OutOfFuel        => .OutOfFuel
+         | .Throwing tag targs st' _ => .Thrown tag targs st'
+         | .ReturnCall id' st' vs =>
+           match runTail fuel m id' st' vs env with
+           | .Success vs2 st2 =>
+             .Success (vs2.take f.results.length ++ callerRemainder) st2
+           | other => other) := by
   simp only [run, hImp]
   rcases m.funcs[id - m.imports.length]? with _ | f
   · rfl
   · simp only
     rcases exec fuel m initial (f.toLocals (args.take f.numParams).reverse) f.body env with
-      _ | ⟨n, _, _⟩ | _ | _ | _ | _
+      _ | ⟨n, _, _⟩ | _ | _ | _ | _ | _ | _
     · rfl
     · cases n <;> rfl
     all_goals rfl

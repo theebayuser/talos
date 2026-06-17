@@ -509,6 +509,11 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           .Fallthrough st { s with values := .f32 (st.mem.read32 (a + off)) :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          .Fallthrough st { s with values := .f32 (st.mem.read32 (a.toUInt32 + off)) :: vs }
       | _ => .Invalid "f32Load: ill-shaped operand stack"
     | _, .f64Load off => match s.values with
       | .i32 a :: vs =>
@@ -516,6 +521,11 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           .Fallthrough st { s with values := .f64 (st.mem.read64 (a + off)) :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          .Fallthrough st { s with values := .f64 (st.mem.read64 (a.toUInt32 + off)) :: vs }
       | _ => .Invalid "f64Load: ill-shaped operand stack"
     | _, .f32Store off => match s.values with
       | .f32 v :: .i32 a :: vs =>
@@ -523,6 +533,11 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           .Fallthrough { st with mem := st.mem.write32 (a + off) v } { s with values := vs }
+      | .f32 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          .Fallthrough { st with mem := st.mem.write32 (a.toUInt32 + off) v } { s with values := vs }
       | _ => .Invalid "f32Store: ill-shaped operand stack"
     | _, .f64Store off => match s.values with
       | .f64 v :: .i32 a :: vs =>
@@ -530,6 +545,11 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           .Fallthrough { st with mem := st.mem.write64 (a + off) v } { s with values := vs }
+      | .f64 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          .Fallthrough { st with mem := st.mem.write64 (a.toUInt32 + off) v } { s with values := vs }
       | _ => .Invalid "f64Store: ill-shaped operand stack"
 
     -- Integer → float
@@ -720,6 +740,145 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
       | .Trap st' msg   => .Trap st' msg
       | .Invalid msg    => .Invalid msg
       | .OutOfFuel      => .OutOfFuel
+      | .Thrown tag args st' => .Throwing tag args st' s
+
+    -- Tail calls. Both build a `ReturnCall` continuation; `run` resolves
+    -- the re-dispatch (consuming one unit of fuel per tail call), so a
+    -- chain of N tail calls needs O(N) fuel but constant host stack.
+    -- `return_call_indirect` performs the same table lookup, null check,
+    -- and signature check as `call_indirect`, with the same trap wording.
+    | _, .returnCall id => .ReturnCall id st s.values
+    | _, .returnCallIndirect typeIdx tableIdx => match s.values with
+      | .i32 i :: rest =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"returnCallIndirect: table index {tableIdx} out of range"
+        | some tbl =>
+          match tbl[i.toNat]? with
+          | none                       => .Trap st "undefined element"
+          | some (.funcref none)       => .Trap st "uninitialized element"
+          | some (.funcref (some fid)) =>
+            match m.funcSig? fid with
+            | none    => .Invalid s!"returnCallIndirect: function index {fid} out of range"
+            | some fn =>
+              match m.types[typeIdx]? with
+              | none    => .Invalid s!"returnCallIndirect: type index {typeIdx} out of range"
+              | some ty =>
+                if fn.params = ty.params ∧ fn.results = ty.results then
+                  .ReturnCall fid st rest
+                else .Trap st "indirect call type mismatch"
+          | some _ => .Invalid "returnCallIndirect: non-funcref table entry"
+      | .i64 i :: rest =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"returnCallIndirect: table index {tableIdx} out of range"
+        | some tbl =>
+          match tbl[i.toNat]? with
+          | none                       => .Trap st "undefined element"
+          | some (.funcref none)       => .Trap st "uninitialized element"
+          | some (.funcref (some fid)) =>
+            match m.funcSig? fid with
+            | none    => .Invalid s!"returnCallIndirect: function index {fid} out of range"
+            | some fn =>
+              match m.types[typeIdx]? with
+              | none    => .Invalid s!"returnCallIndirect: type index {typeIdx} out of range"
+              | some ty =>
+                if fn.params = ty.params ∧ fn.results = ty.results then
+                  .ReturnCall fid st rest
+                else .Trap st "indirect call type mismatch"
+          | some _ => .Invalid "returnCallIndirect: non-funcref table entry"
+      | _ => .Invalid "returnCallIndirect: ill-shaped operand stack"
+
+    -- Exception handling. `throw` pops the tag's parameters and raises;
+    -- `tryTable` runs its body like a `block` and intercepts a raised
+    -- exception with the first matching clause, branching to the
+    -- clause's label with the exception's arguments (plus the package as
+    -- an `exnref` for the `_ref` forms; `catch_all` passes no values).
+    | _, .throwI tagIdx =>
+      match m.tags[tagIdx]? with
+      | none => .Invalid s!"throw: tag index {tagIdx} out of range"
+      | some tagTy =>
+        let n := tagTy.params.length
+        if s.values.length < n then .Invalid "throw: ill-shaped operand stack"
+        else .Throwing tagIdx (s.values.take n) st { s with values := s.values.drop n }
+    | _, .throwRef => match s.values with
+      | .exnref none :: _ => .Trap st "null exception reference"
+      | .exnref (some i) :: vs =>
+        match st.exns[i]? with
+        | none => .Invalid s!"throwRef: exception index {i} out of range"
+        | some (tag, args) => .Throwing tag args st { s with values := vs }
+      | _ => .Invalid "throwRef: ill-shaped operand stack"
+    | f + 1, .tryTable ps rs catches body =>
+      let belowStack := s.values.drop ps
+      match exec f m st s body env with
+      | .Fallthrough r' s' =>
+        .Fallthrough r' { s' with values := s'.values.take rs ++ belowStack }
+      | .Break 0 r' s' =>
+        .Fallthrough r' { s' with values := s'.values.take rs ++ belowStack }
+      | .Break (k + 1) r' s' => .Break k r' s'
+      | .Throwing tag args r' s' =>
+        match catches.find? (fun c => match c with
+          | .catch t _ | .catchRef t _ => t = tag
+          | .catchAll _ | .catchAllRef _ => true) with
+        | none => .Throwing tag args r' s'
+        | some c =>
+          -- Values pushed for the branch target (head = top of stack)
+          -- and the possibly-extended store (the `_ref` forms register
+          -- the exception package).
+          let (vals, r'') : List Value × Store α := match c with
+            | .catch _ _      => (args, r')
+            | .catchAll _     => ([], r')
+            | .catchRef _ _   =>
+              (.exnref (some r'.exns.length) :: args,
+               { r' with exns := r'.exns ++ [(tag, args)] })
+            | .catchAllRef _  =>
+              ([.exnref (some r'.exns.length)],
+               { r' with exns := r'.exns ++ [(tag, args)] })
+          let lbl : Nat := match c with
+            | .catch _ l | .catchRef _ l | .catchAll l | .catchAllRef l => l
+          -- A caught exception branches like a `br lbl` executed at the
+          -- position of the `tryTable` itself: label 0 is the construct
+          -- *enclosing* it, so the break propagates outward unchanged.
+          .Break lbl r'' { s' with values := vals ++ belowStack }
+      | other => other
+
+    -- Typed function references. `call_ref` dispatches through a popped
+    -- funcref (null traps with the spec's wording); validation makes a
+    -- runtime signature check unnecessary. `return_call_ref` is the
+    -- tail-call form, resolved by `run` like the other tail calls.
+    | f + 1, .callRef _typeIdx => match s.values with
+      | .funcref none :: _ => .Trap st "null function reference"
+      | .funcref (some fid) :: rest =>
+        (match run f m fid st rest env with
+         | .Success vs st' => .Fallthrough st' { s with values := vs }
+         | .Trap st' msg   => .Trap st' msg
+         | .Invalid msg    => .Invalid msg
+         | .OutOfFuel      => .OutOfFuel
+         | .Thrown tag args st' => .Throwing tag args st' s)
+      | _ => .Invalid "callRef: ill-shaped operand stack"
+    | _, .returnCallRef _typeIdx => match s.values with
+      | .funcref none :: _ => .Trap st "null function reference"
+      | .funcref (some fid) :: rest => .ReturnCall fid st rest
+      | _ => .Invalid "returnCallRef: ill-shaped operand stack"
+    | _, .refAsNonNull => match s.values with
+      | v :: vs =>
+        match v.isNullRef? with
+        | some true  => .Trap st "null reference"
+        | some false => .Fallthrough st { s with values := v :: vs }
+        | none       => .Invalid "refAsNonNull: ill-shaped operand stack"
+      | _ => .Invalid "refAsNonNull: ill-shaped operand stack"
+    | _, .brOnNull n => match s.values with
+      | v :: vs =>
+        match v.isNullRef? with
+        | some true  => .Break n st { s with values := vs }
+        | some false => .Fallthrough st { s with values := v :: vs }
+        | none       => .Invalid "brOnNull: ill-shaped operand stack"
+      | _ => .Invalid "brOnNull: ill-shaped operand stack"
+    | _, .brOnNonNull n => match s.values with
+      | v :: vs =>
+        match v.isNullRef? with
+        | some true  => .Fallthrough st { s with values := vs }
+        | some false => .Break n st { s with values := v :: vs }
+        | none       => .Invalid "brOnNonNull: ill-shaped operand stack"
+      | _ => .Invalid "brOnNonNull: ill-shaped operand stack"
 
     -- Indirect call. Pop an i32 index, look up the entry in the chosen
     -- table, then dispatch to the referenced function — trapping on
@@ -733,10 +892,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         | none     => .Invalid s!"callIndirect: table index {tableIdx} out of range"
         | some tbl =>
           match tbl[i.toNat]? with
-          | none           => .Trap st "undefined element"
-          | some none      => .Trap st "uninitialized element"
-          | some (some fid) =>
-            match m.funcs[fid]? with
+          | none                       => .Trap st "undefined element"
+          | some (.funcref none)       => .Trap st "uninitialized element"
+          | some (.funcref (some fid)) =>
+            -- Signature lookup is in the *unified* function index space
+            -- (imports first), matching what the table entry refers to.
+            match m.funcSig? fid with
             | none    => .Invalid s!"callIndirect: function index {fid} out of range"
             | some fn =>
               match m.types[typeIdx]? with
@@ -748,7 +909,34 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
                   | .Trap st' msg   => .Trap st' msg
                   | .Invalid msg    => .Invalid msg
                   | .OutOfFuel      => .OutOfFuel
+                  | .Thrown tag args st' => .Throwing tag args st' s
                 else .Trap st "indirect call type mismatch"
+          | some _ => .Invalid "callIndirect: non-funcref table entry"
+      -- table64: the selector arrives as an i64. The flow is identical to
+      -- the i32 arm above.
+      | .i64 i :: rest =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"callIndirect: table index {tableIdx} out of range"
+        | some tbl =>
+          match tbl[i.toNat]? with
+          | none                       => .Trap st "undefined element"
+          | some (.funcref none)       => .Trap st "uninitialized element"
+          | some (.funcref (some fid)) =>
+            match m.funcSig? fid with
+            | none    => .Invalid s!"callIndirect: function index {fid} out of range"
+            | some fn =>
+              match m.types[typeIdx]? with
+              | none    => .Invalid s!"callIndirect: type index {typeIdx} out of range"
+              | some ty =>
+                if fn.params = ty.params ∧ fn.results = ty.results then
+                  match run f m fid st rest env with
+                  | .Success vs st' => .Fallthrough st' { s with values := vs }
+                  | .Trap st' msg   => .Trap st' msg
+                  | .Invalid msg    => .Invalid msg
+                  | .OutOfFuel      => .OutOfFuel
+                  | .Thrown tag args st' => .Throwing tag args st' s
+                else .Trap st "indirect call type mismatch"
+          | some _ => .Invalid "callIndirect: non-funcref table entry"
       | _ => .Invalid "callIndirect: ill-shaped operand stack"
 
     -- Memory load / store. Every access traps when
@@ -762,6 +950,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v : UInt32 := (st.mem.read8 (a + off)).toUInt32
           .Fallthrough st { s with values := .i32 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt32 := (st.mem.read8 (a.toUInt32 + off)).toUInt32
+          .Fallthrough st { s with values := .i32 v :: vs }
       | _ => .Invalid "load8U: ill-shaped operand stack"
     | _, .load8S off => match s.values with
       | .i32 a :: vs =>
@@ -769,6 +963,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let v : UInt32 := (Int32.ofInt (signExtend (st.mem.read8 (a + off)).toNat 8)).toUInt32
+          .Fallthrough st { s with values := .i32 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt32 := (Int32.ofInt (signExtend (st.mem.read8 (a.toUInt32 + off)).toNat 8)).toUInt32
           .Fallthrough st { s with values := .i32 v :: vs }
       | _ => .Invalid "load8S: ill-shaped operand stack"
     | _, .load16U off => match s.values with
@@ -778,6 +978,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v := st.mem.read16 (a + off)
           .Fallthrough st { s with values := .i32 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v := st.mem.read16 (a.toUInt32 + off)
+          .Fallthrough st { s with values := .i32 v :: vs }
       | _ => .Invalid "load16U: ill-shaped operand stack"
     | _, .load16S off => match s.values with
       | .i32 a :: vs =>
@@ -785,6 +991,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let v : UInt32 := (Int32.ofInt (signExtend (st.mem.read16 (a + off)).toNat 16)).toUInt32
+          .Fallthrough st { s with values := .i32 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt32 := (Int32.ofInt (signExtend (st.mem.read16 (a.toUInt32 + off)).toNat 16)).toUInt32
           .Fallthrough st { s with values := .i32 v :: vs }
       | _ => .Invalid "load16S: ill-shaped operand stack"
     | _, .load32 off => match s.values with
@@ -794,6 +1006,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v := st.mem.read32 (a + off)
           .Fallthrough st { s with values := .i32 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v := st.mem.read32 (a.toUInt32 + off)
+          .Fallthrough st { s with values := .i32 v :: vs }
       | _ => .Invalid "load32: ill-shaped operand stack"
     | _, .store8 off => match s.values with
       | .i32 v :: .i32 a :: vs =>
@@ -801,6 +1019,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let mem' := st.mem.write8 (a + off) v.toUInt8
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i32 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write8 (a.toUInt32 + off) v.toUInt8
           .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store8: ill-shaped operand stack"
     | _, .store16 off => match s.values with
@@ -810,6 +1034,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let mem' := st.mem.write16 (a + off) v
           .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i32 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write16 (a.toUInt32 + off) v
+          .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store16: ill-shaped operand stack"
     | _, .store32 off => match s.values with
       | .i32 v :: .i32 a :: vs =>
@@ -817,6 +1047,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let mem' := st.mem.write32 (a + off) v
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i32 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write32 (a.toUInt32 + off) v
           .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store32: ill-shaped operand stack"
     | _, .load64 off => match s.values with
@@ -826,6 +1062,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v := st.mem.read64 (a + off)
           .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v := st.mem.read64 (a.toUInt32 + off)
+          .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load64: ill-shaped operand stack"
     | _, .store64 off => match s.values with
       | .i64 v :: .i32 a :: vs =>
@@ -833,6 +1075,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let mem' := st.mem.write64 (a + off) v
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i64 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write64 (a.toUInt32 + off) v
           .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store64: ill-shaped operand stack"
 
@@ -843,6 +1091,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v : UInt64 := (st.mem.read8 (a + off)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (st.mem.read8 (a.toUInt32 + off)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load8UI64: ill-shaped operand stack"
     | _, .load8SI64 off => match s.values with
       | .i32 a :: vs =>
@@ -850,6 +1104,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read8 (a + off)).toNat 8)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read8 (a.toUInt32 + off)).toNat 8)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load8SI64: ill-shaped operand stack"
     | _, .load16UI64 off => match s.values with
@@ -859,6 +1119,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v : UInt64 := (st.mem.read16 (a + off)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (st.mem.read16 (a.toUInt32 + off)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load16UI64: ill-shaped operand stack"
     | _, .load16SI64 off => match s.values with
       | .i32 a :: vs =>
@@ -866,6 +1132,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read16 (a + off)).toNat 16)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read16 (a.toUInt32 + off)).toNat 16)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load16SI64: ill-shaped operand stack"
     | _, .load32UI64 off => match s.values with
@@ -875,6 +1147,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let v : UInt64 := (st.mem.read32 (a + off)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (st.mem.read32 (a.toUInt32 + off)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load32UI64: ill-shaped operand stack"
     | _, .load32SI64 off => match s.values with
       | .i32 a :: vs =>
@@ -882,6 +1160,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read32 (a + off)).toNat 32)).toUInt64
+          .Fallthrough st { s with values := .i64 v :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let v : UInt64 := (Int64.ofInt (signExtend (st.mem.read32 (a.toUInt32 + off)).toNat 32)).toUInt64
           .Fallthrough st { s with values := .i64 v :: vs }
       | _ => .Invalid "load32SI64: ill-shaped operand stack"
     | _, .store8I64 off => match s.values with
@@ -891,6 +1175,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let mem' := st.mem.write8 (a + off) v.toUInt8
           .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i64 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 1 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write8 (a.toUInt32 + off) v.toUInt8
+          .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store8I64: ill-shaped operand stack"
     | _, .store16I64 off => match s.values with
       | .i64 v :: .i32 a :: vs =>
@@ -898,6 +1188,12 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           .Trap st "out of bounds memory access"
         else
           let mem' := st.mem.write16 (a + off) v.toUInt32
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i64 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 2 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write16 (a.toUInt32 + off) v.toUInt32
           .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store16I64: ill-shaped operand stack"
     | _, .store32I64 off => match s.values with
@@ -907,14 +1203,21 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let mem' := st.mem.write32 (a + off) v.toUInt32
           .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .i64 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 4 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.write32 (a.toUInt32 + off) v.toUInt32
+          .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "store32I64: ill-shaped operand stack"
 
     -- Memory size / grow. `memory.grow`'s cap is computed once via
     -- `Module.memoryCap` so the semantics and the corresponding wp
     -- lemma share a single matchable shape.
     | _, .memorySize =>
-      let v : UInt32 := st.mem.pages.toUInt32
-      .Fallthrough st { s with values := .i32 v :: s.values }
+      -- The result type follows the declared memory's address type
+      -- (memory64): i64 pages for a 64-bit memory, i32 otherwise.
+      .Fallthrough st { s with values := sizeValue m.memIs64 st.mem.pages :: s.values }
     | _, .memoryGrow => match s.values with
       | .i32 delta :: vs =>
         match st.mem.grow delta m.memoryCap with
@@ -923,6 +1226,20 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
             { s with values := .i32 cur.toUInt32 :: vs }
         | none =>
           .Fallthrough st { s with values := .i32 (0xFFFFFFFF : UInt32) :: vs }
+      -- memory64: delta and result are i64. A delta of 2^32 pages or more
+      -- can never fit under the implementation cap, so it fails directly
+      -- (the spec permits growth to fail); otherwise defer to `Mem.grow`
+      -- with the (faithful) 32-bit truncation of the delta.
+      | .i64 delta :: vs =>
+        if delta.toNat ≥ 2 ^ 32 then
+          .Fallthrough st { s with values := .i64 (0xFFFFFFFFFFFFFFFF : UInt64) :: vs }
+        else
+          match st.mem.grow delta.toUInt32 m.memoryCap with
+          | some (mem', cur) =>
+            .Fallthrough { st with mem := mem' }
+              { s with values := .i64 cur.toUInt64 :: vs }
+          | none =>
+            .Fallthrough st { s with values := .i64 (0xFFFFFFFFFFFFFFFF : UInt64) :: vs }
       | _ => .Invalid "memoryGrow: ill-shaped operand stack"
 
     -- Memory fill. Wasm stack discipline: dst is pushed first, then val,
@@ -937,6 +1254,14 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         else
           let mem' := st.mem.fill dst.toNat len.toNat val.toUInt8
           .Fallthrough { st with mem := mem' } { s with values := vs }
+      -- memory64: dst and len are i64; the fill value stays i32 per spec.
+      | .i64 len :: .i32 val :: .i64 dst :: vs =>
+        let byteCap : Nat := st.mem.pages * 65536
+        if dst.toNat + len.toNat > byteCap then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.fill dst.toNat len.toNat val.toUInt8
+          .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "memoryFill: ill-shaped operand stack"
 
     -- memory.copy: pops len :: src :: dst (top = len). Trap is observed
@@ -945,6 +1270,14 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
     -- whole instruction traps with no partial effect.
     | _, .memoryCopy => match s.values with
       | .i32 len :: .i32 src :: .i32 dst :: vs =>
+        let byteCap : Nat := st.mem.pages * 65536
+        if dst.toNat + len.toNat > byteCap ∨ src.toNat + len.toNat > byteCap then
+          .Trap st "out of bounds memory access"
+        else
+          let mem' := st.mem.copy dst.toNat src.toNat len.toNat
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      -- memory64: all three operands are i64.
+      | .i64 len :: .i64 src :: .i64 dst :: vs =>
         let byteCap : Nat := st.mem.pages * 65536
         if dst.toNat + len.toNat > byteCap ∨ src.toNat + len.toNat > byteCap then
           .Trap st "out of bounds memory access"
@@ -975,6 +1308,23 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
           else
             let mem' := st.mem.writeBytesFrom dst.toNat segBytes src.toNat len.toNat
             .Fallthrough { st with mem := mem' } { s with values := vs }
+      -- memory64: dst takes the memory's address type (i64); src and len
+      -- index into the data segment and stay i32 per spec.
+      | .i32 len :: .i32 src :: .i64 dst :: vs =>
+        match st.dataSegments[i]? with
+        | none => .Invalid s!"memoryInit: segment index {i} out of range"
+        | some none =>
+          if 0 < len.toNat ∨ dst.toNat + len.toNat > st.mem.pages * 65536 then
+            .Trap st "out of bounds memory access"
+          else
+            .Fallthrough st { s with values := vs }
+        | some (some segBytes) =>
+          if src.toNat + len.toNat > segBytes.length
+             ∨ dst.toNat + len.toNat > st.mem.pages * 65536 then
+            .Trap st "out of bounds memory access"
+          else
+            let mem' := st.mem.writeBytesFrom dst.toNat segBytes src.toNat len.toNat
+            .Fallthrough { st with mem := mem' } { s with values := vs }
       | _ => .Invalid "memoryInit: ill-shaped operand stack"
 
     -- data.drop i: mark segment `i` as no-longer-available. Idempotent
@@ -985,6 +1335,261 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
       | some _ =>
         let dataSegments' := st.dataSegments.set i none
         .Fallthrough { st with dataSegments := dataSegments' } s
+
+    -- Multi-memory. Swap memory `k` (and its declaration) into the
+    -- default slot, run the wrapped memory instruction, then swap the
+    -- (possibly written) memory back into `extraMems`. The wrapped
+    -- instruction never breaks/returns, so only `Fallthrough` and `Trap`
+    -- carry a store to map back.
+    | f + 1, .memOp k inner =>
+      match st.extraMems[k - 1]?, m.extraMemories[k - 1]? with
+      | some memK, some declK =>
+        let stIn : Store α := { st with mem := memK }
+        let mIn : Module := { m with memory := some declK }
+        let restore (st' : Store α) : Store α :=
+          { st' with mem := st.mem, extraMems := st.extraMems.set (k - 1) st'.mem }
+        match execOne f mIn stIn s inner env with
+        | .Fallthrough st' s' => .Fallthrough (restore st') s'
+        | .Trap st' msg       => .Trap (restore st') msg
+        | .Throwing t a st' s' => .Throwing t a (restore st') s'
+        | other               => other
+      | _, _ => .Invalid s!"memOp: memory index {k} out of range"
+
+    -- Cross-memory memory.copy (multi-memory). Each address operand is
+    -- read by its runtime width (i32 or i64, per its memory's declared
+    -- address type); bounds are checked in ℕ before any write.
+    | _, .memoryCopyBetween dstMem srcMem => match s.values with
+      | lenV :: srcV :: dstV :: vs =>
+        match lenV.addrNat?, srcV.addrNat?, dstV.addrNat? with
+        | some len, some src, some dst =>
+          let memOf : Nat → Option Mem := fun k =>
+            if k = 0 then some st.mem else st.extraMems[k - 1]?
+          match memOf dstMem, memOf srcMem with
+          | some dMem, some sMem =>
+            if dst + len > dMem.pages * 65536 ∨ src + len > sMem.pages * 65536 then
+              .Trap st "out of bounds memory access"
+            else
+              let dMem' := dMem.writeBytes dst (sMem.readBytes src len)
+              let st' :=
+                if dstMem = 0 then { st with mem := dMem' }
+                else { st with extraMems := st.extraMems.set (dstMem - 1) dMem' }
+              .Fallthrough st' { s with values := vs }
+          | _, _ => .Invalid "memoryCopyBetween: memory index out of range"
+        | _, _, _ => .Invalid "memoryCopyBetween: ill-shaped operand stack"
+      | _ => .Invalid "memoryCopyBetween: ill-shaped operand stack"
+
+    -- SIMD (v128). Lane semantics live in `Interpreter.Wasm.Simd`; the
+    -- arms here only manage the operand stack and (for the memory
+    -- variants) the usual Nat-domain bounds checks. A v128 occupies 16
+    -- bytes in memory, lane 0 first (little-endian), so the two 64-bit
+    -- halves are the low word at `a` and the high word at `a+8`.
+    | _, .vConst bits => .Fallthrough st { s with values := .v128 bits :: s.values }
+    | _, .vUnOp op => match s.values with
+      | .v128 a :: vs => .Fallthrough st { s with values := .v128 (op.eval a) :: vs }
+      | _ => .Invalid "vUnOp: ill-shaped operand stack"
+    | _, .vBinOp op => match s.values with
+      | .v128 b :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 (op.eval a b) :: vs }
+      | _ => .Invalid "vBinOp: ill-shaped operand stack"
+    | _, .vFma sh neg => match s.values with
+      | .v128 c :: .v128 b :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 (Simd.fma sh neg a b c) :: vs }
+      | _ => .Invalid "vFma: ill-shaped operand stack"
+    | _, .vDotAdd => match s.values with
+      | .v128 c :: .v128 b :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 (Simd.dotAdd a b c) :: vs }
+      | _ => .Invalid "vDotAdd: ill-shaped operand stack"
+    | _, .vBitselect => match s.values with
+      | .v128 c :: .v128 b :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 ((a &&& c) ||| (b &&& ~~~c)) :: vs }
+      | _ => .Invalid "vBitselect: ill-shaped operand stack"
+    | _, .vTestOp op => match s.values with
+      | .v128 a :: vs => .Fallthrough st { s with values := .i32 (op.eval a) :: vs }
+      | _ => .Invalid "vTestOp: ill-shaped operand stack"
+    | _, .vShiftOp op => match s.values with
+      | .i32 k :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 (op.eval a k) :: vs }
+      | _ => .Invalid "vShiftOp: ill-shaped operand stack"
+    | _, .vSplat sh => match s.values with
+      | v :: vs =>
+        match v.scalarBitsFor? sh with
+        | some x => .Fallthrough st { s with values := .v128 (Simd.splat sh x) :: vs }
+        | none   => .Invalid "vSplat: ill-shaped operand stack"
+      | _ => .Invalid "vSplat: ill-shaped operand stack"
+    | _, .vExtractLane sh signed lane => match s.values with
+      | .v128 a :: vs =>
+        let n := Simd.getLane sh.laneBits lane a
+        let v : Value := match sh with
+          | .i8x16 => .i32 (if signed then UInt32.ofNat (Simd.toU 32 (Simd.sx 8 n))
+                            else UInt32.ofNat n)
+          | .i16x8 => .i32 (if signed then UInt32.ofNat (Simd.toU 32 (Simd.sx 16 n))
+                            else UInt32.ofNat n)
+          | .i32x4 => .i32 (UInt32.ofNat n)
+          | .i64x2 => .i64 (UInt64.ofNat n)
+          | .f32x4 => .f32 (UInt32.ofNat n)
+          | .f64x2 => .f64 (UInt64.ofNat n)
+        .Fallthrough st { s with values := v :: vs }
+      | _ => .Invalid "vExtractLane: ill-shaped operand stack"
+    | _, .vReplaceLane sh lane => match s.values with
+      | v :: .v128 a :: vs =>
+        match v.scalarBitsFor? sh with
+        | some x =>
+          .Fallthrough st
+            { s with values := .v128 (Simd.setLane sh.laneBits lane a x) :: vs }
+        | none => .Invalid "vReplaceLane: ill-shaped operand stack"
+      | _ => .Invalid "vReplaceLane: ill-shaped operand stack"
+    | _, .vShuffle idx => match s.values with
+      | .v128 b :: .v128 a :: vs =>
+        .Fallthrough st { s with values := .v128 (Simd.shuffle idx a b) :: vs }
+      | _ => .Invalid "vShuffle: ill-shaped operand stack"
+    | _, .v128Load off => match s.values with
+      | .i32 a :: vs =>
+        if a.toNat + off.toNat + 16 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let lo := st.mem.read64 (a + off)
+          let hi := st.mem.read64 (a + off + 8)
+          let bits := BitVec.ofNat 128 (lo.toNat + hi.toNat * 2 ^ 64)
+          .Fallthrough st { s with values := .v128 bits :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 16 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let lo := st.mem.read64 (a.toUInt32 + off)
+          let hi := st.mem.read64 (a.toUInt32 + off + 8)
+          let bits := BitVec.ofNat 128 (lo.toNat + hi.toNat * 2 ^ 64)
+          .Fallthrough st { s with values := .v128 bits :: vs }
+      | _ => .Invalid "v128Load: ill-shaped operand stack"
+    | _, .v128Store off => match s.values with
+      | .v128 v :: .i32 a :: vs =>
+        if a.toNat + off.toNat + 16 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let lo := UInt64.ofNat (v.toNat % 2 ^ 64)
+          let hi := UInt64.ofNat (v.toNat / 2 ^ 64)
+          let mem' := (st.mem.write64 (a + off) lo).write64 (a + off + 8) hi
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .v128 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + 16 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let lo := UInt64.ofNat (v.toNat % 2 ^ 64)
+          let hi := UInt64.ofNat (v.toNat / 2 ^ 64)
+          let mem' := (st.mem.write64 (a.toUInt32 + off) lo).write64 (a.toUInt32 + off + 8) hi
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | _ => .Invalid "v128Store: ill-shaped operand stack"
+    | _, .v128LoadExt srcBits signed off => match s.values with
+      | .i32 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let word := st.mem.read64 (a + off)
+          let dstBits := srcBits * 2
+          let cnt := 64 / srcBits
+          let lanes := (List.range cnt).map fun i =>
+            let n := (word.toNat >>> (i * srcBits)) % 2 ^ srcBits
+            if signed then Simd.toU dstBits (Simd.sx srcBits n) else n
+          .Fallthrough st { s with values := .v128 (Simd.ofLanes dstBits lanes) :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let word := st.mem.read64 (a.toUInt32 + off)
+          let dstBits := srcBits * 2
+          let cnt := 64 / srcBits
+          let lanes := (List.range cnt).map fun i =>
+            let n := (word.toNat >>> (i * srcBits)) % 2 ^ srcBits
+            if signed then Simd.toU dstBits (Simd.sx srcBits n) else n
+          .Fallthrough st { s with values := .v128 (Simd.ofLanes dstBits lanes) :: vs }
+      | _ => .Invalid "v128LoadExt: ill-shaped operand stack"
+    | _, .v128LoadSplat bits off => match s.values with
+      | .i32 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 8  => (st.mem.read8 (a + off)).toNat
+            | 16 => (st.mem.read16 (a + off)).toNat
+            | 32 => (st.mem.read32 (a + off)).toNat
+            | _  => (st.mem.read64 (a + off)).toNat
+          let lanes := List.replicate (128 / bits) n
+          .Fallthrough st { s with values := .v128 (Simd.ofLanes bits lanes) :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 8  => (st.mem.read8 (a.toUInt32 + off)).toNat
+            | 16 => (st.mem.read16 (a.toUInt32 + off)).toNat
+            | 32 => (st.mem.read32 (a.toUInt32 + off)).toNat
+            | _  => (st.mem.read64 (a.toUInt32 + off)).toNat
+          let lanes := List.replicate (128 / bits) n
+          .Fallthrough st { s with values := .v128 (Simd.ofLanes bits lanes) :: vs }
+      | _ => .Invalid "v128LoadSplat: ill-shaped operand stack"
+    | _, .v128LoadZero bits off => match s.values with
+      | .i32 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 32 => (st.mem.read32 (a + off)).toNat
+            | _  => (st.mem.read64 (a + off)).toNat
+          .Fallthrough st { s with values := .v128 (BitVec.ofNat 128 n) :: vs }
+      | .i64 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 32 => (st.mem.read32 (a.toUInt32 + off)).toNat
+            | _  => (st.mem.read64 (a.toUInt32 + off)).toNat
+          .Fallthrough st { s with values := .v128 (BitVec.ofNat 128 n) :: vs }
+      | _ => .Invalid "v128LoadZero: ill-shaped operand stack"
+    | _, .v128LoadLane bits lane off => match s.values with
+      | .v128 v :: .i32 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 8  => (st.mem.read8 (a + off)).toNat
+            | 16 => (st.mem.read16 (a + off)).toNat
+            | 32 => (st.mem.read32 (a + off)).toNat
+            | _  => (st.mem.read64 (a + off)).toNat
+          .Fallthrough st { s with values := .v128 (Simd.setLane bits lane v n) :: vs }
+      | .v128 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n : Nat := match bits with
+            | 8  => (st.mem.read8 (a.toUInt32 + off)).toNat
+            | 16 => (st.mem.read16 (a.toUInt32 + off)).toNat
+            | 32 => (st.mem.read32 (a.toUInt32 + off)).toNat
+            | _  => (st.mem.read64 (a.toUInt32 + off)).toNat
+          .Fallthrough st { s with values := .v128 (Simd.setLane bits lane v n) :: vs }
+      | _ => .Invalid "v128LoadLane: ill-shaped operand stack"
+    | _, .v128StoreLane bits lane off => match s.values with
+      | .v128 v :: .i32 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n := Simd.getLane bits lane v
+          let mem' := match bits with
+            | 8  => st.mem.write8  (a + off) (UInt8.ofNat n)
+            | 16 => st.mem.write16 (a + off) (UInt32.ofNat n)
+            | 32 => st.mem.write32 (a + off) (UInt32.ofNat n)
+            | _  => st.mem.write64 (a + off) (UInt64.ofNat n)
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | .v128 v :: .i64 a :: vs =>
+        if a.toNat + off.toNat + bits / 8 > st.mem.pages * 65536 then
+          .Trap st "out of bounds memory access"
+        else
+          let n := Simd.getLane bits lane v
+          let mem' := match bits with
+            | 8  => st.mem.write8  (a.toUInt32 + off) (UInt8.ofNat n)
+            | 16 => st.mem.write16 (a.toUInt32 + off) (UInt32.ofNat n)
+            | 32 => st.mem.write32 (a.toUInt32 + off) (UInt32.ofNat n)
+            | _  => st.mem.write64 (a.toUInt32 + off) (UInt64.ofNat n)
+          .Fallthrough { st with mem := mem' } { s with values := vs }
+      | _ => .Invalid "v128StoreLane: ill-shaped operand stack"
 
     -- Return / parametric / nullary
     | _, .ret  => .Return st s.values
@@ -999,13 +1604,17 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
     | _, .nop => .Fallthrough st s
     | _, .unreachable => .Trap st "unreachable"
 
-    -- Reference instructions. `funcref` values reuse the existing
-    -- `Value.funcref (Option Nat)` representation, so these never touch the
-    -- store: `refNull`/`refFunc` just push a value, `refIsNull` inspects one.
-    | _, .refNull      => .Fallthrough st { s with values := .funcref none :: s.values }
-    | _, .refFunc fidx => .Fallthrough st { s with values := .funcref (some fidx) :: s.values }
+    -- Reference instructions. Reference values are carried directly on
+    -- the operand stack (`Value.funcref` / `Value.externref`), so these
+    -- never touch the store: the null/func constructors just push a
+    -- value, `refIsNull` inspects one.
+    | _, .refNull       => .Fallthrough st { s with values := .funcref none :: s.values }
+    | _, .refNullExtern => .Fallthrough st { s with values := .externref none :: s.values }
+    | _, .refFunc fidx  => .Fallthrough st { s with values := .funcref (some fidx) :: s.values }
     | _, .refIsNull => match s.values with
       | .funcref r :: vs =>
+        .Fallthrough st { s with values := .i32 (if r.isNone then 1 else 0) :: vs }
+      | .externref r :: vs =>
         .Fallthrough st { s with values := .i32 (if r.isNone then 1 else 0) :: vs }
       | _ => .Invalid "refIsNull: ill-shaped operand stack"
 
@@ -1021,13 +1630,180 @@ def execOne (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (inst : Instr
         | some tbl =>
           match tbl[i.toNat]? with
           | none   => .Trap st "out of bounds table access"
-          | some r => .Fallthrough st { s with values := .funcref r :: vs }
+          | some r => .Fallthrough st { s with values := r :: vs }
+      -- table64: the element index arrives as an i64.
+      | .i64 i :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableGet: table index {tableIdx} out of range"
+        | some tbl =>
+          match tbl[i.toNat]? with
+          | none   => .Trap st "out of bounds table access"
+          | some r => .Fallthrough st { s with values := r :: vs }
       | _ => .Invalid "tableGet: ill-shaped operand stack"
     | _, .tableSize tableIdx =>
       match st.tables[tableIdx]? with
       | none     => .Invalid s!"tableSize: table index {tableIdx} out of range"
       | some tbl =>
-        .Fallthrough st { s with values := .i32 (UInt32.ofNat tbl.length) :: s.values }
+        -- The result type follows the declared table's address type
+        -- (table64): i64 for a 64-bit table, i32 otherwise.
+        .Fallthrough st
+          { s with values := sizeValue (m.tableIs64 tableIdx) tbl.length :: s.values }
+
+    -- table.set t: pops [val(ref), idx(i32)] (top = val).
+    | _, .tableSet tableIdx => match s.values with
+      | v :: .i32 i :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableSet: table index {tableIdx} out of range"
+        | some tbl =>
+          if i.toNat < tbl.length then
+            let tables' := listSetAt st.tables tableIdx (listSetAt tbl i.toNat v)
+            .Fallthrough { st with tables := tables' } { s with values := vs }
+          else .Trap st "out of bounds table access"
+      -- table64: the element index arrives as an i64.
+      | v :: .i64 i :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableSet: table index {tableIdx} out of range"
+        | some tbl =>
+          if i.toNat < tbl.length then
+            let tables' := listSetAt st.tables tableIdx (listSetAt tbl i.toNat v)
+            .Fallthrough { st with tables := tables' } { s with values := vs }
+          else .Trap st "out of bounds table access"
+      | _ => .Invalid "tableSet: ill-shaped operand stack"
+
+    -- table.grow t: pops [delta(i32), init(ref)] (top = delta). Pushes
+    -- the old size on success, -1 on failure. Growth past the declared
+    -- max (or the implementation ceiling, see `Module.tableCap`) fails.
+    | _, .tableGrow tableIdx => match s.values with
+      | .i32 delta :: init :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableGrow: table index {tableIdx} out of range"
+        | some tbl =>
+          let cur := tbl.length
+          if cur + delta.toNat ≤ m.tableCap tableIdx then
+            let tables' := listSetAt st.tables tableIdx
+              (tbl ++ List.replicate delta.toNat init)
+            .Fallthrough { st with tables := tables' }
+              { s with values := .i32 (UInt32.ofNat cur) :: vs }
+          else
+            .Fallthrough st { s with values := .i32 (0xFFFFFFFF : UInt32) :: vs }
+      -- table64: delta and result are i64.
+      | .i64 delta :: init :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableGrow: table index {tableIdx} out of range"
+        | some tbl =>
+          let cur := tbl.length
+          if cur + delta.toNat ≤ m.tableCap tableIdx then
+            let tables' := listSetAt st.tables tableIdx
+              (tbl ++ List.replicate delta.toNat init)
+            .Fallthrough { st with tables := tables' }
+              { s with values := .i64 (UInt64.ofNat cur) :: vs }
+          else
+            .Fallthrough st { s with values := .i64 (0xFFFFFFFFFFFFFFFF : UInt64) :: vs }
+      | _ => .Invalid "tableGrow: ill-shaped operand stack"
+
+    -- table.fill t: pops [len(i32), val(ref), dst(i32)] (top = len).
+    -- Bounds are checked before any write, matching the spec's atomicity.
+    | _, .tableFill tableIdx => match s.values with
+      | .i32 len :: v :: .i32 dst :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableFill: table index {tableIdx} out of range"
+        | some tbl =>
+          if dst.toNat + len.toNat > tbl.length then
+            .Trap st "out of bounds table access"
+          else
+            let tbl' := listWriteAt tbl dst.toNat (List.replicate len.toNat v)
+            .Fallthrough { st with tables := listSetAt st.tables tableIdx tbl' }
+              { s with values := vs }
+      -- table64: dst and len are i64.
+      | .i64 len :: v :: .i64 dst :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableFill: table index {tableIdx} out of range"
+        | some tbl =>
+          if dst.toNat + len.toNat > tbl.length then
+            .Trap st "out of bounds table access"
+          else
+            let tbl' := listWriteAt tbl dst.toNat (List.replicate len.toNat v)
+            .Fallthrough { st with tables := listSetAt st.tables tableIdx tbl' }
+              { s with values := vs }
+      | _ => .Invalid "tableFill: ill-shaped operand stack"
+
+    -- table.copy d s: pops [len(i32), src(i32), dst(i32)] (top = len).
+    -- The source slice is captured before the write, so overlapping
+    -- ranges behave like memmove, as the spec requires.
+    | _, .tableCopy dstIdx srcIdx => match s.values with
+      | .i32 len :: .i32 src :: .i32 dst :: vs =>
+        match st.tables[dstIdx]?, st.tables[srcIdx]? with
+        | some dstTbl, some srcTbl =>
+          if dst.toNat + len.toNat > dstTbl.length
+             ∨ src.toNat + len.toNat > srcTbl.length then
+            .Trap st "out of bounds table access"
+          else
+            let slice := (srcTbl.drop src.toNat).take len.toNat
+            let dstTbl' := listWriteAt dstTbl dst.toNat slice
+            .Fallthrough { st with tables := listSetAt st.tables dstIdx dstTbl' }
+              { s with values := vs }
+        | _, _ => .Invalid s!"tableCopy: table index out of range"
+      -- table64: all three operands are i64.
+      | .i64 len :: .i64 src :: .i64 dst :: vs =>
+        match st.tables[dstIdx]?, st.tables[srcIdx]? with
+        | some dstTbl, some srcTbl =>
+          if dst.toNat + len.toNat > dstTbl.length
+             ∨ src.toNat + len.toNat > srcTbl.length then
+            .Trap st "out of bounds table access"
+          else
+            let slice := (srcTbl.drop src.toNat).take len.toNat
+            let dstTbl' := listWriteAt dstTbl dst.toNat slice
+            .Fallthrough { st with tables := listSetAt st.tables dstIdx dstTbl' }
+              { s with values := vs }
+        | _, _ => .Invalid s!"tableCopy: table index out of range"
+      | _ => .Invalid "tableCopy: ill-shaped operand stack"
+
+    -- table.init t e: pops [len(i32), src(i32), dst(i32)] (top = len).
+    -- A dropped segment behaves as length 0; bounds are checked before
+    -- any write.
+    | _, .tableInit tableIdx elemIdx => match s.values with
+      | .i32 len :: .i32 src :: .i32 dst :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableInit: table index {tableIdx} out of range"
+        | some tbl =>
+          match st.elementSegments[elemIdx]? with
+          | none => .Invalid s!"tableInit: segment index {elemIdx} out of range"
+          | some seg =>
+            let segFuncs := seg.getD []
+            if src.toNat + len.toNat > segFuncs.length
+               ∨ dst.toNat + len.toNat > tbl.length then
+              .Trap st "out of bounds table access"
+            else
+              let slice := ((segFuncs.drop src.toNat).take len.toNat).map Value.funcref
+              let tbl' := listWriteAt tbl dst.toNat slice
+              .Fallthrough { st with tables := listSetAt st.tables tableIdx tbl' }
+                { s with values := vs }
+      -- table64: dst takes the table's address type (i64); src and len
+      -- index into the element segment and stay i32 per spec.
+      | .i32 len :: .i32 src :: .i64 dst :: vs =>
+        match st.tables[tableIdx]? with
+        | none     => .Invalid s!"tableInit: table index {tableIdx} out of range"
+        | some tbl =>
+          match st.elementSegments[elemIdx]? with
+          | none => .Invalid s!"tableInit: segment index {elemIdx} out of range"
+          | some seg =>
+            let segFuncs := seg.getD []
+            if src.toNat + len.toNat > segFuncs.length
+               ∨ dst.toNat + len.toNat > tbl.length then
+              .Trap st "out of bounds table access"
+            else
+              let slice := ((segFuncs.drop src.toNat).take len.toNat).map Value.funcref
+              let tbl' := listWriteAt tbl dst.toNat slice
+              .Fallthrough { st with tables := listSetAt st.tables tableIdx tbl' }
+                { s with values := vs }
+      | _ => .Invalid "tableInit: ill-shaped operand stack"
+
+    -- elem.drop e: mark element segment `e` as dropped. Idempotent.
+    | _, .elemDrop elemIdx =>
+      match st.elementSegments[elemIdx]? with
+      | none => .Invalid s!"elemDrop: segment index {elemIdx} out of range"
+      | some _ =>
+        .Fallthrough { st with elementSegments := st.elementSegments.set elemIdx none } s
 
 def exec (fuel : Nat) (m : Module) (st : Store α) (s : Locals) (p : Program)
     (env : HostEnv α := {}) : Continuation α :=
@@ -1073,7 +1849,26 @@ def run (fuel : Nat) (m : Module) (id : Nat)
       | Continuation.Invalid msg      => .Invalid msg
       | Continuation.OutOfFuel        => .OutOfFuel
       | Continuation.Trap st msg      => .Trap st msg
+      -- Tail call: the callee replaces this frame. Validation guarantees
+      -- the callee's result types equal `f.results`, so truncating its
+      -- results to `f.results.length` and restoring this frame's
+      -- caller-remainder preserves the standard calling convention.
+      | Continuation.Throwing tag args st' _ => .Thrown tag args st'
+      | Continuation.ReturnCall id' st' vs =>
+        match runTail fuel m id' st' vs env with
+        | .Success vs2 st2 => .Success (vs2.take f.results.length ++ callerRemainder) st2
+        | other => other
     | none => .Invalid "Function index out of bounds"
+
+/-- Resolve a pending tail call: re-dispatch with one less fuel. Kept as
+its own (mutual) definition so `run`'s equation lemma does not mention
+`run` itself — `simp only [run]` unfolds one frame and stops at
+`runTail`, exactly like the pre-tail-call unfolding discipline. -/
+def runTail (fuel : Nat) (m : Module) (id : Nat)
+    (st : Store α) (vs : List Value) (env : HostEnv α := {}) : Result α :=
+  match fuel with
+  | 0 => .OutOfFuel
+  | f' + 1 => run f' m id st vs env
 
 end
 
