@@ -7,6 +7,7 @@ import CodeLib.RustStd.Frame
 import CodeLib.RustStd.Region
 import CodeLib.RustStd.MemArray
 import CodeLib.RustStd.MemFillLoop
+import CodeLib.RustStd.MemCopyLoop
 import CodeLib.RustStd.UInt
 import CodeLib.RustStd.U64.Basic
 import CodeLib.RustStd.U64.AbsDiff

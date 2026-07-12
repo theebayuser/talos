@@ -79,3 +79,66 @@ theorem Mem.words64_write64_extend (m : Mem) (base : UInt32) (n : Nat) (v : UInt
   rw [Mem.words64_succ,
       Mem.words64_write64_outside m base n _ v (by omega) (Or.inr (by rw [haddr])),
       hfill, Mem.read64_write64_same, List.replicate_succ']
+
+/-! ## 32-bit twin
+
+`Mem.words32` is the `u32` array view, matching the element stride of
+`MemRegion.slot32` and the `wordsAt` view used in memory-based `[u32]` specs. -/
+
+/-- The `List UInt32` view of the `u32` array `[base, base + 4*n)`. -/
+def Mem.words32 (m : Mem) (base : UInt32) (n : Nat) : List UInt32 :=
+  (List.range n).map fun k => m.read32 (base + 4 * (UInt32.ofNat k))
+
+@[simp] theorem Mem.length_words32 (m : Mem) (base : UInt32) (n : Nat) :
+    (m.words32 base n).length = n := by
+  simp [Mem.words32]
+
+theorem Mem.getElem_words32 (m : Mem) (base : UInt32) (n k : Nat) (h : k < n) :
+    (m.words32 base n)[k]'(by simpa using h) = m.read32 (base + 4 * UInt32.ofNat k) := by
+  simp [Mem.words32]
+
+/-- Two `u32` array views agree iff their words agree pointwise. -/
+theorem Mem.words32_ext {m m' : Mem} {base : UInt32} {n : Nat}
+    (h : ∀ k < n, m.read32 (base + 4 * UInt32.ofNat k) = m'.read32 (base + 4 * UInt32.ofNat k)) :
+    m.words32 base n = m'.words32 base n := by
+  apply List.ext_getElem (by simp)
+  intro k hk _
+  simp only [length_words32] at hk
+  rw [getElem_words32 m base n k hk, getElem_words32 m' base n k hk, h k hk]
+
+/-- A `write32` disjoint from the whole `[base, base+4n)` region leaves the
+view unchanged. -/
+theorem Mem.words32_write32_outside (m : Mem) (base : UInt32) (n : Nat) (a v : UInt32)
+    (hbnd : base.toNat + 4 * n ≤ 4294967296)
+    (hout : a.toNat + 4 ≤ base.toNat ∨ base.toNat + 4 * n ≤ a.toNat) :
+    (m.write32 a v).words32 base n = m.words32 base n := by
+  apply words32_ext
+  intro k hk
+  have hkn : (UInt32.ofNat k).toNat = k :=
+    UInt32.toNat_ofNat_of_lt' (by have : (UInt32.size : Nat) = 4294967296 := rfl; omega)
+  have haddr : (base + 4 * UInt32.ofNat k).toNat = base.toNat + 4 * k := by
+    have := MemRegion.slot32_base_toNat base (UInt32.ofNat k) (by rw [hkn]; omega)
+    rw [hkn] at this; exact this
+  exact Mem.read32_write32_disjoint m a _ v (by rw [haddr]; omega)
+
+/-- One more word: `words32 base (n+1)` is `words32 base n` with the `n`-th
+word appended. -/
+theorem Mem.words32_succ (m : Mem) (base : UInt32) (n : Nat) :
+    m.words32 base (n + 1) = m.words32 base n ++ [m.read32 (base + 4 * UInt32.ofNat n)] := by
+  simp [Mem.words32, List.range_succ, List.map_append]
+
+/-- Writing the `n`-th slot with `w` appends `w` to the length-`n` view (the
+earlier words are framed away). The store-into-a-fresh-slot step shared by
+copy/fill loops over a `u32` array. -/
+theorem Mem.words32_write32_snoc (m : Mem) (base : UInt32) (n : Nat) (w : UInt32)
+    (hbnd : base.toNat + 4 * (n + 1) ≤ 4294967296) :
+    (m.write32 (base + 4 * UInt32.ofNat n) w).words32 base (n + 1)
+      = m.words32 base n ++ [w] := by
+  have hkn : (UInt32.ofNat n).toNat = n :=
+    UInt32.toNat_ofNat_of_lt' (by have : (UInt32.size : Nat) = 4294967296 := rfl; omega)
+  have haddr : (base + 4 * UInt32.ofNat n).toNat = base.toNat + 4 * n := by
+    have := MemRegion.slot32_base_toNat base (UInt32.ofNat n) (by rw [hkn]; omega)
+    rw [hkn] at this; exact this
+  rw [Mem.words32_succ,
+      Mem.words32_write32_outside m base n _ w (by omega) (Or.inr (by rw [haddr])),
+      Mem.read32_write32_same]
