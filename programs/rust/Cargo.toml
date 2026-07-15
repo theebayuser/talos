@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "swap_elements",
+  "swap_elements_opt3",
   "rust_array",
   "rust_array_tests",
   "rust_u64_tests",
@@ -23,4 +24,10 @@ codegen-units = 1
 # compiled at `opt-level = 3` (everything else at the workspace default 0). The
 # two emitted wasm modules are the subject of a program-equivalence proof.
 [profile.release.package.num_integer_opt3]
+opt-level = 3
+
+# Likewise `swap_elements_opt3` mirrors `swap_elements` at `opt-level = 3`.
+# Unlike the `gcd` pair, this function's result lives in linear memory, so the
+# two builds are related by a *memory-aware* observational equivalence.
+[profile.release.package.swap_elements_opt3]
 opt-level = 3

@@ -77,5 +77,9 @@ name = "swap_elements"
 version = "0.1.0"
 
 [[package]]
+name = "swap_elements_opt3"
+version = "0.1.0"
+
+[[package]]
 name = "total_variation"
 version = "0.1.0"
