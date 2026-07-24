@@ -814,4 +814,396 @@ theorem run_env_indep
     run fuel m id initial args env = run fuel m id initial args env' :=
   (env_indep_aux fuel).2.2 m hm id initial args env env'
 
+/-! ## Memory-size monotonicity
+
+The default linear memory only ever grows: no instruction lowers `mem.pages`.
+`memory.grow` raises it (or fails, leaving it fixed); every other store update
+touches `mem.bytes` or a non-`mem` field. For an import-free, single-memory
+module a successful `run` therefore ends with at least as many pages as it
+started — `run_pages_mono`, and the pages-bound corollary
+`run_pages_bound_preserved` that carries a `… ≤ pages * 65536` precondition
+through the call. Proved by the same joint fuel induction as `fuel_mono_aux` /
+`env_indep_aux`.
+
+The `imports = []` hypothesis plays the same role as in `env_indep_aux`: a host
+call threads back an arbitrary `Store` (`HostResult`), which could shrink memory,
+so that arm is ruled out. `extraMemories = []` rules out `memOp`: its
+`Fallthrough`/`Trap`/`Throwing` arms restore the default memory untouched, but
+the remaining outcomes pass through with the *swapped* store — default slot
+holding the extra memory — whose page count is unrelated to `st.mem.pages`.
+(Those outcomes never occur for the memory instructions `memOp` wraps, but
+proving that would take an instruction classification; the hypothesis is the
+direct route.) -/
+
+/-- `p` lower-bounds the pages of the store carried by a `Continuation` (vacuous
+for the store-less `Invalid`/`OutOfFuel`). -/
+private def Continuation.pagesGe (p : Nat) : Continuation α → Prop
+  | .Fallthrough st _   => p ≤ st.mem.pages
+  | .Break _ st _       => p ≤ st.mem.pages
+  | .Return st _        => p ≤ st.mem.pages
+  | .Trap st _          => p ≤ st.mem.pages
+  | .Invalid _          => True
+  | .OutOfFuel          => True
+  | .ReturnCall _ st _  => p ≤ st.mem.pages
+  | .Throwing _ _ st _  => p ≤ st.mem.pages
+
+/-- `p` lower-bounds the pages of the store carried by a `Result`. -/
+private def Result.pagesGe (p : Nat) : Result α → Prop
+  | .Success _ st => p ≤ st.mem.pages
+  | .Trap st _    => p ≤ st.mem.pages
+  | .Invalid _    => True
+  | .OutOfFuel    => True
+  | .Thrown _ _ st => p ≤ st.mem.pages
+
+-- Every `Mem` mutator except `grow` leaves the page count fixed (all are
+-- `{ m with bytes := … }` updates). Named locally (not `@[simp]`) to feed the
+-- per-case `simp only` closers below without touching codelib's own copies.
+private theorem Mem.write8_pages (m : Mem) (a : UInt32) (v : UInt8) :
+    (m.write8 a v).pages = m.pages := rfl
+private theorem Mem.write16_pages (m : Mem) (a : UInt32) (v : UInt32) :
+    (m.write16 a v).pages = m.pages := rfl
+private theorem Mem.write32_pages (m : Mem) (a : UInt32) (v : UInt32) :
+    (m.write32 a v).pages = m.pages := rfl
+private theorem Mem.write64_pages (m : Mem) (a : UInt32) (v : UInt64) :
+    (m.write64 a v).pages = m.pages := rfl
+private theorem Mem.fill_pages (m : Mem) (o l : Nat) (v : UInt8) :
+    (m.fill o l v).pages = m.pages := rfl
+private theorem Mem.copy_pages (m : Mem) (d s l : Nat) :
+    (m.copy d s l).pages = m.pages := rfl
+private theorem Mem.writeBytes_pages (m : Mem) (o : Nat) (data : List UInt8) :
+    (m.writeBytes o data).pages = m.pages := rfl
+private theorem Mem.writeBytesFrom_pages (m : Mem) (d : Nat) (src : List UInt8)
+    (so l : Nat) : (m.writeBytesFrom d src so l).pages = m.pages := rfl
+
+private theorem Continuation.pagesGe_mono {p q : Nat} {c : Continuation α}
+    (hpq : p ≤ q) (h : c.pagesGe q) : c.pagesGe p := by
+  cases c <;> simp only [Continuation.pagesGe] at h ⊢ <;>
+    first | trivial | exact Nat.le_trans hpq h
+
+/-- `memory.grow` never lowers the page count. -/
+private theorem Mem.le_grow_pages {m m' : Mem} {delta : UInt32} {cap cur : Nat}
+    (h : m.grow delta cap = some (m', cur)) : m.pages ≤ m'.pages := by
+  simp only [Mem.grow] at h
+  split at h
+  · simp only [Option.some.injEq, Prod.mk.injEq] at h
+    obtain ⟨hm, _⟩ := h; subst hm; exact Nat.le_add_right _ _
+  · simp at h
+
+/-- GC operations only ever touch `gcHeap`/operands, never the linear memory. -/
+private theorem execGcOp_pagesGe (m : Module) (st : Store α) (s : Locals)
+    (op : GcOp) : (execGcOp m st s op).pagesGe st.mem.pages := by
+  cases op <;>
+    simp only [execGcOp] <;>
+    repeat' first
+      | apply Nat.le_refl
+      | trivial
+      | (simp only [Continuation.pagesGe]; done)
+      | split
+
+/-- `tryTable`'s catch dispatch only re-packages the throw store `r'` (the
+`catch_ref` forms extend `exns`, leaving `mem` fixed), so it preserves the
+bound. -/
+private theorem tryTableThrow_pagesGe {p tag : Nat} {args : List Value}
+    {r' : Store α} {s' : Locals} {catches : List CatchClause}
+    {belowStack : List Value} (hr : p ≤ r'.mem.pages) :
+    Continuation.pagesGe p
+      (match catches.find? (fun c => match c with
+          | .catch t _ | .catchRef t _ => t = tag
+          | .catchAll _ | .catchAllRef _ => true) with
+       | none => .Throwing tag args r' s'
+       | some c =>
+         let (vals, r'') : List Value × Store α := match c with
+           | .catch _ _      => (args, r')
+           | .catchAll _     => ([], r')
+           | .catchRef _ _   =>
+             (.exnref (some r'.exns.length) :: args,
+              { r' with exns := r'.exns ++ [(tag, args)] })
+           | .catchAllRef _  =>
+             ([.exnref (some r'.exns.length)],
+              { r' with exns := r'.exns ++ [(tag, args)] })
+         let lbl : Nat := match c with
+           | .catch _ l | .catchRef _ l | .catchAll l | .catchAllRef l => l
+         .Break lbl r'' { s' with values := vals ++ belowStack }) := by
+  cases catches.find? (fun c => match c with
+      | .catch t _ | .catchRef t _ => t = tag
+      | .catchAll _ | .catchAllRef _ => true) with
+  | none => exact hr
+  | some c => cases c <;> exact hr
+
+set_option maxHeartbeats 1600000 in
+/-- Joint page-monotonicity for `execOne`, `exec`, and `run`, over any
+import-free single-memory module. Proved by induction on fuel, mirroring
+`fuel_mono_aux`. `run_pages_mono` is the projection. -/
+private theorem pages_mono_aux {α : Type} : ∀ (f : Nat),
+    (∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (inst : Instruction) (env : HostEnv α),
+        (execOne f m st s inst env).pagesGe st.mem.pages) ∧
+    (∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (p : Program) (env : HostEnv α),
+        (exec f m st s p env).pagesGe st.mem.pages) ∧
+    (∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (id : Nat) (initial : Store α) (args : List Value) (env : HostEnv α),
+        (run f m id initial args env).pagesGe initial.mem.pages) := by
+  -- `exec` inherits the bound from the per-instruction bound at the same fuel,
+  -- by induction on the program. Fuel-generic, reused at both induction steps.
+  have exec_step : ∀ (f : Nat) (m : Module),
+      (∀ (st : Store α) (s : Locals) (inst : Instruction) (env : HostEnv α),
+        (execOne f m st s inst env).pagesGe st.mem.pages) →
+      ∀ (st : Store α) (s : Locals) (p : Program) (env : HostEnv α),
+        (exec f m st s p env).pagesGe st.mem.pages := by
+    intro f m hOne st s p env
+    induction p generalizing st s with
+    | nil => simp only [exec, Continuation.pagesGe]; exact Nat.le_refl _
+    | cons inst rest ihRest =>
+      have hO := hOne st s inst env
+      simp only [exec]
+      rcases hres : execOne f m st s inst env with
+        ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs⟩
+          | ⟨tag,targs,st',s'⟩
+      · rw [hres] at hO; simp only [Continuation.pagesGe] at hO
+        exact Continuation.pagesGe_mono hO (ihRest st' s')
+      all_goals (rw [hres] at hO; exact hO)
+  intro f
+  induction f with
+  | zero =>
+    have hOne : ∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (inst : Instruction) (env : HostEnv α),
+        (execOne 0 m st s inst env).pagesGe st.mem.pages := by
+      intro m hh hme st s inst env
+      cases inst <;>
+        first
+        | (simp only [execOne.eq_def, Continuation.pagesGe]; done)
+        | (simp only [execOne.eq_def, Continuation.pagesGe, Mem.write8_pages,
+              Mem.write16_pages, Mem.write32_pages, Mem.write64_pages, Mem.fill_pages,
+              Mem.copy_pages, Mem.writeBytes_pages, Mem.writeBytesFrom_pages]
+           repeat' first | apply Nat.le_refl | trivial | omega | split)
+    have hExec : ∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (p : Program) (env : HostEnv α),
+        (exec 0 m st s p env).pagesGe st.mem.pages :=
+      fun m hh hme => exec_step 0 m (hOne m hh hme)
+    refine ⟨hOne, hExec, ?_⟩
+    intro m hh hme id initial args env
+    have hnone : m.imports[id]? = none := by
+      rw [List.eq_nil_of_length_eq_zero hh]; rfl
+    simp only [run, hnone]
+    rcases h : m.funcs[id - m.imports.length]? with _ | fn
+    · simp only [Result.pagesGe]
+    · have hE := hExec m hh hme initial
+        (fn.toLocals (args.take fn.numParams).reverse) fn.body env
+      simp only
+      rcases hres : exec 0 m initial (fn.toLocals (args.take fn.numParams).reverse) fn.body env
+        with ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs⟩
+          | ⟨tag,targs,st',s'⟩ <;>
+        rw [hres] at hE <;> simp only [Continuation.pagesGe] at hE
+      · simpa only [Result.pagesGe] using hE
+      · rcases n with _ | n
+        · simpa only [Result.pagesGe] using hE
+        · simp only [Result.pagesGe]
+      · simpa only [Result.pagesGe] using hE
+      · simpa only [Result.pagesGe] using hE
+      · simp only [Result.pagesGe]
+      · simp only [Result.pagesGe]
+      · simp only [runTail, Result.pagesGe]
+      · simpa only [Result.pagesGe] using hE
+  | succ k ih =>
+    obtain ⟨ihOne, ihExec, ihRun⟩ := ih
+    have hOne : ∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (inst : Instruction) (env : HostEnv α),
+        (execOne (k + 1) m st s inst env).pagesGe st.mem.pages := by
+      intro m hh hme st s inst env
+      -- Shared closer for the three call arms: the `run` result is mapped to a
+      -- `Continuation` preserving the carried store, so the bound is `ihRun`.
+      have callOk : ∀ (fid : Nat) (rest : List Value),
+          Continuation.pagesGe st.mem.pages
+            (match run k m fid st rest env with
+             | .Success vs st' => .Fallthrough st' { s with values := vs }
+             | .Trap st' msg   => .Trap st' msg
+             | .Invalid msg    => .Invalid msg
+             | .OutOfFuel      => .OutOfFuel
+             | .Thrown tag args st' => .Throwing tag args st' s) := by
+        intro fid rest
+        have hR := ihRun m hh hme fid st rest env
+        rcases hres : run k m fid st rest env with
+          ⟨vs,st'⟩ | ⟨st',msg⟩ | msg | _ | ⟨tag,args,st'⟩ <;>
+          rw [hres] at hR <;> first | exact hR | trivial
+      cases inst with
+      | block ps rs body =>
+        have hE := ihExec m hh hme st s body env
+        simp only [execOne.eq_def]
+        rcases hres : exec k m st s body env with
+          ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs⟩
+            | ⟨tag,targs,st',s'⟩ <;>
+          rw [hres] at hE <;> first | exact hE | (cases n <;> exact hE)
+      | loop ps rs body =>
+        have hE := ihExec m hh hme st s body env
+        simp only [execOne_loop_succ]
+        rcases hres : exec k m st s body env with
+          ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs⟩
+            | ⟨tag,targs,st',s'⟩
+        · rw [hres] at hE; exact hE
+        · rw [hres] at hE; simp only [Continuation.pagesGe] at hE
+          rcases n with _ | n
+          · exact Continuation.pagesGe_mono hE
+              (ihOne m hh hme st' _ (.loop ps rs body) env)
+          · exact hE
+        · rw [hres] at hE; exact hE
+        · rw [hres] at hE; exact hE
+        · trivial
+        · trivial
+        · rw [hres] at hE; exact hE
+        · rw [hres] at hE; exact hE
+      | iff ps rs thn els =>
+        simp only [execOne.eq_def]
+        rcases hvals : s.values with _ | ⟨v, vs⟩
+        · simp only [Continuation.pagesGe]
+        · cases v with
+          | i32 c =>
+            by_cases hc : c ≠ 0
+            · simp only [if_pos hc]
+              have hE := ihExec m hh hme st { s with values := vs } thn env
+              rcases hres : exec k m st { s with values := vs } thn env with
+                ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs'⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs'⟩
+                  | ⟨tag,targs,st',s'⟩ <;>
+                rw [hres] at hE <;> first | exact hE | (cases n <;> exact hE)
+            · simp only [if_neg hc]
+              have hE := ihExec m hh hme st { s with values := vs } els env
+              rcases hres : exec k m st { s with values := vs } els env with
+                ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs'⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs'⟩
+                  | ⟨tag,targs,st',s'⟩ <;>
+                rw [hres] at hE <;> first | exact hE | (cases n <;> exact hE)
+          | _ => simp only [Continuation.pagesGe]
+      | call id =>
+        simp only [execOne.eq_def]
+        exact callOk id s.values
+      | callIndirect ti tj =>
+        simp only [execOne.eq_def]
+        repeat' first
+          | exact callOk _ _
+          | apply Nat.le_refl
+          | trivial
+          | (simp only [Continuation.pagesGe]; done)
+          | split
+      | callRef ti =>
+        rcases hvals : s.values with _ | ⟨v, rest⟩
+        · simp only [execOne.eq_def, hvals, Continuation.pagesGe]
+        · cases hv : v with
+          | funcref r =>
+            cases hr : r with
+            | none =>
+              simp only [execOne.eq_def, hvals, hv, hr, Continuation.pagesGe]
+              exact Nat.le_refl _
+            | some fid =>
+              simp only [execOne.eq_def, hvals, hv, hr]
+              exact callOk fid rest
+          | _ => simp only [execOne.eq_def, hvals, hv, Continuation.pagesGe]
+      | tryTable ps rs catches body =>
+        have hE := ihExec m hh hme st s body env
+        simp only [execOne.eq_def]
+        generalize hgen : exec k m st s body env = E at hE ⊢
+        cases E with
+        | Fallthrough r' s' => exact hE
+        | Break n r' s' => cases n <;> exact hE
+        | Return r' vs => exact hE
+        | Trap r' msg => exact hE
+        | Invalid msg => trivial
+        | OutOfFuel => trivial
+        | ReturnCall id' r' vs => exact hE
+        | Throwing tag args r' s' =>
+          simp only [Continuation.pagesGe] at hE
+          exact tryTableThrow_pagesGe hE
+      | memOp kIdx inner =>
+        have hnone : m.extraMemories[kIdx - 1]? = none := by
+          rw [List.eq_nil_of_length_eq_zero hme]; rfl
+        simp only [execOne_memOp_succ, hnone]
+        split <;> simp_all [Continuation.pagesGe]
+      | gc op =>
+        simp only [execOne.eq_def]
+        exact execGcOp_pagesGe m st s op
+      | memoryGrow =>
+        simp only [execOne.eq_def]
+        repeat' first
+          | apply Nat.le_refl
+          | trivial
+          | (simp only [Continuation.pagesGe]; done)
+          | (rename_i h; simp only [Continuation.pagesGe]; exact Mem.le_grow_pages h)
+          | split
+      | memoryCopyBetween dstMem srcMem =>
+        simp only [execOne.eq_def]
+        repeat' first
+          | apply Nat.le_refl
+          | trivial
+          | (simp only [Continuation.pagesGe, Mem.writeBytes_pages]; done)
+          | (simp only [Continuation.pagesGe, Mem.writeBytes_pages]; simp_all; done)
+          | split
+      | _ =>
+        simp only [execOne.eq_def]
+        repeat' first
+          | apply Nat.le_refl
+          | omega
+          | trivial
+          | (simp only [Continuation.pagesGe]; done)
+          | split
+    have hExec : ∀ (m : Module) (_ : m.imports.length = 0) (_ : m.extraMemories.length = 0)
+        (st : Store α) (s : Locals) (p : Program) (env : HostEnv α),
+        (exec (k + 1) m st s p env).pagesGe st.mem.pages :=
+      fun m hh hme => exec_step (k + 1) m (hOne m hh hme)
+    refine ⟨hOne, hExec, ?_⟩
+    intro m hh hme id initial args env
+    have hnone : m.imports[id]? = none := by
+      rw [List.eq_nil_of_length_eq_zero hh]; rfl
+    simp only [run, hnone]
+    rcases h : m.funcs[id - m.imports.length]? with _ | fn
+    · simp only [Result.pagesGe]
+    · have hE := hExec m hh hme initial
+        (fn.toLocals (args.take fn.numParams).reverse) fn.body env
+      simp only
+      rcases hres : exec (k+1) m initial (fn.toLocals (args.take fn.numParams).reverse) fn.body env
+        with ⟨st',s'⟩ | ⟨n,st',s'⟩ | ⟨st',vs⟩ | ⟨st',msg⟩ | msg | _ | ⟨id',st',vs⟩
+          | ⟨tag,targs,st',s'⟩ <;>
+        rw [hres] at hE <;> simp only [Continuation.pagesGe] at hE
+      · simpa only [Result.pagesGe] using hE
+      · rcases n with _ | n
+        · simpa only [Result.pagesGe] using hE
+        · simp only [Result.pagesGe]
+      · simpa only [Result.pagesGe] using hE
+      · simpa only [Result.pagesGe] using hE
+      · simp only [Result.pagesGe]
+      · simp only [Result.pagesGe]
+      · -- ReturnCall: runTail (k+1) = run k; compose with ihRun by transitivity.
+        simp only [runTail]
+        have hR := ihRun m hh hme id' st' vs env
+        rcases hrun : run k m id' st' vs env with
+          ⟨vs2,st2⟩ | ⟨st2,msg⟩ | msg | _ | ⟨tag,args,st2⟩ <;>
+          (try rw [hrun] at hR) <;>
+          simp only [Result.pagesGe] at hR ⊢ <;>
+          first | trivial | exact Nat.le_trans hE hR
+      · simpa only [Result.pagesGe] using hE
+
+/-- With no imported functions and only the default memory, a successful `run`
+never shrinks the linear memory: it ends with at least as many pages as it
+started. (Imports are excluded because a host call may thread back an arbitrary
+store; extra memories because `memOp` could otherwise carry a different memory's
+size out.) -/
+theorem run_pages_mono
+    {m : Module} (hm : m.imports.length = 0) (hme : m.extraMemories.length = 0)
+    {id : Nat} {initial : Store α} {args : List Value}
+    {vs : List Value} {st' : Store α} {fuel : Nat} {env : HostEnv α}
+    (h : run fuel m id initial args env = .Success vs st') :
+    initial.mem.pages ≤ st'.mem.pages := by
+  have := (pages_mono_aux fuel).2.2 m hm hme id initial args env
+  rw [h] at this
+  simpa only [Result.pagesGe] using this
+
+/-- A pages-scaled bound (`N ≤ pages * 65536`, the shape of the in-bounds
+preconditions the program specs carry) survives a successful `run`: what fit
+in the initial memory still fits in the final one. -/
+theorem run_pages_bound_preserved
+    {m : Module} (hm : m.imports.length = 0) (hme : m.extraMemories.length = 0)
+    {id : Nat} {initial : Store α} {args : List Value}
+    {vs : List Value} {st' : Store α} {fuel : Nat} {env : HostEnv α}
+    {N : Nat} (hN : N ≤ initial.mem.pages * 65536)
+    (h : run fuel m id initial args env = .Success vs st') :
+    N ≤ st'.mem.pages * 65536 :=
+  Nat.le_trans hN (Nat.mul_le_mul_right 65536 (run_pages_mono hm hme h))
+
 end Wasm

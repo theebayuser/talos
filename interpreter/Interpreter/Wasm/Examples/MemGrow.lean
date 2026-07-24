@@ -1,5 +1,6 @@
 import Interpreter.Wasm.Wp.Tactic
 import Interpreter.Wasm.Examples.Harness
+import Interpreter.Wasm.Semantics.Lemmas
 
 /-! ## Example: memory.size / memory.grow
 
@@ -56,5 +57,28 @@ theorem memoryGrow_oversize_returns_neg_one :
     runValues 10 growModule 2 growModule.initialStore []
       = [.i32 1, .i32 0xFFFFFFFF] := by
   native_decide
+
+/-! ### Consumer of `run_pages_mono`
+
+`growModule` has no imports and only the default memory, so `run_pages_mono`
+applies. Unlike the `native_decide` checks above these hold for an *arbitrary*
+initial store — it is the theorem, not computation, doing the work. -/
+
+/-- Running the grow-then-size function never shrinks the memory, from any
+starting store. -/
+theorem grow_never_shrinks
+    {st st' : Store Unit} {vs : List Value} {fuel : Nat}
+    (h : run fuel growModule 1 st [] = .Success vs st') :
+    st.mem.pages ≤ st'.mem.pages :=
+  run_pages_mono (by decide) (by decide) h
+
+/-- An in-bounds pointer stays in bounds across the call: the
+`… ≤ pages * 65536` shape carried by the program specs is preserved. -/
+theorem grow_preserves_bound
+    {st st' : Store Unit} {vs : List Value} {fuel N : Nat}
+    (hN : N ≤ st.mem.pages * 65536)
+    (h : run fuel growModule 1 st [] = .Success vs st') :
+    N ≤ st'.mem.pages * 65536 :=
+  run_pages_bound_preserved (by decide) (by decide) hN h
 
 end Wasm
