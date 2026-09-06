@@ -2,6 +2,7 @@ import CodeLib.Attrs
 import CodeLib.Basic
 import CodeLib.Entry
 import CodeLib.Equivalence
+import CodeLib.StdioContract
 import CodeLib.UInt32
 import CodeLib.UInt64
 import CodeLib.WordCodec
@@ -35,7 +36,6 @@ import CodeLib.RustStd.Vec.Codec
 import CodeLib.RustStd.Borsh
 import CodeLib.RustStd.HashMap.Basic
 import CodeLib.RustStd.HashMap.Codec
-import CodeLib.RustStd.StdioContract
 import CodeLib.Near.State
 import CodeLib.Near.Env
 import CodeLib.Near.Proof
