@@ -42,12 +42,10 @@ open Wasm Wasm.RustStd
 
 /-- The generated module imports standard I/O plus the allocator-private,
 terminal OOM notification. -/
-theorem module_imports : «module».imports = StdIO.imports ++ OOM.imports := by
-  native_decide
+theorem module_imports : «module».imports = StdIO.imports ++ OOM.imports := by decide +kernel
 
 /-- Every import of the generated module is implemented by the universal host. -/
-theorem universal_host_covers : Universal.covers «module» = true := by
-  native_decide
+theorem universal_host_covers : Universal.covers «module» = true := by decide +kernel
 
 /-- The name-keyed universal environment satisfies the matching relational
 host contract regardless of generated import indices. -/
@@ -174,8 +172,7 @@ theorem contract_names_start :
     ["map_len", "map_get", "map_contains_key", "map_insert", "map_remove"].all
       (fun op =>
         (startCallConfig? (Universal.envFor «module») «module» op
-          (Universal.State.ofInput [])).isSome) = true := by
-  native_decide
+          (Universal.State.ofInput [])).isSome) = true := by decide +kernel
 
 /-- One `map_insert` output, pinned to the bytes the Rust crate writes for the
 same call.  The input map arrives as `[(2, 20), (1, 10)]`, which is not in key
@@ -185,14 +182,15 @@ without it the three pairs would come back in the order they arrived.
 The mirror of this check is `borsh_layout_matches_the_lean_model` in
 `programs/rust/rust_hash_map/src/lib.rs`, which asserts the same 29 bytes
 against real borsh.  Both sides name the same literal, so the model and the
-crate are pinned to each other and not only to themselves. -/
+crate are pinned to each other and not only to themselves.
+The proof evaluates by `cbv`: `sortByKey` is `List.mergeSort`, which is
+well-founded recursion, so `decide +kernel` does not reduce it. -/
 theorem insert_output_sorts :
     insertOutput
         ([3, 0, 0, 0] ++ [30, 0, 0, 0] ++ [2, 0, 0, 0] ++
           [2, 0, 0, 0, 20, 0, 0, 0] ++ [1, 0, 0, 0, 10, 0, 0, 0])
       = [0] ++ [3, 0, 0, 0] ++ [1, 0, 0, 0, 10, 0, 0, 0] ++
-          [2, 0, 0, 0, 20, 0, 0, 0] ++ [3, 0, 0, 0, 30, 0, 0, 0] := by
-  native_decide
+          [2, 0, 0, 0, 20, 0, 0, 0] ++ [3, 0, 0, 0, 30, 0, 0, 0] := by cbv
 
 /-! ## Reading the contracts
 
