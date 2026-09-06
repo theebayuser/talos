@@ -34,12 +34,10 @@ open Wasm Wasm.RustStd
 
 /-- The generated module imports standard I/O plus the allocator-private,
 terminal OOM notification. -/
-theorem module_imports : «module».imports = StdIO.imports ++ OOM.imports := by
-  native_decide
+theorem module_imports : «module».imports = StdIO.imports ++ OOM.imports := by decide +kernel
 
 /-- Every import of the generated module is implemented by the universal host. -/
-theorem universal_host_covers : Universal.covers «module» = true := by
-  native_decide
+theorem universal_host_covers : Universal.covers «module» = true := by decide +kernel
 
 /-- The name-keyed universal environment satisfies the matching relational
 host contract regardless of generated import indices. -/
@@ -186,8 +184,7 @@ theorem contract_names_start :
     ["vec_len", "vec_push", "vec_pop", "vec_get", "vec_contains", "vec_sum32"].all
       (fun op =>
         (startCallConfig? (Universal.envFor «module») «module» op
-          (Universal.State.ofInput [])).isSome) = true := by
-  native_decide
+          (Universal.State.ofInput [])).isSome) = true := by decide +kernel
 
 /-! ## Reading the contracts
 
