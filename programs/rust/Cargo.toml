@@ -21,6 +21,7 @@ members = [
   "rust_vec",
   "mergesort",
   "gcd_stdio",
+  "hex_stdio",
 ]
 [profile.release]
 opt-level = 0
@@ -61,4 +62,10 @@ opt-level = 3
 opt-level = 3
 
 [profile.release.package.gcd_stdio]
+opt-level = 3
+
+[profile.release.package.hex_stdio]
+opt-level = 3
+
+[profile.release.package.hex]
 opt-level = 3
